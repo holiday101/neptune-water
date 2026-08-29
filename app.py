@@ -36,15 +36,15 @@ def _fmt_dt(value, with_time=True):
     return ts.strftime("%b %-d, %Y %-I:%M %p") if with_time else ts.strftime("%b %-d, %Y")
 
 
-def _leak_color(mode_consumption, threshold):
+def _leak_color(min_consumption, threshold):
     """Fill color for a parcel on the map: neutral blue if not currently a
     continuous leak, yellow-to-red by severity if it is. Log-scaled since
     continuous rates span a huge range in practice (single digits up to a
     couple thousand gal/hr for a stuck commercial valve) — a linear scale
     would make everything above a modest leak look equally maxed-out red."""
-    if mode_consumption is None or pd.isna(mode_consumption):
+    if min_consumption is None or pd.isna(min_consumption):
         return [70, 130, 220, 60]
-    t = min(math.log(max(mode_consumption, threshold) / threshold + 1) / math.log(50), 1.0)
+    t = min(math.log(max(min_consumption, threshold) / threshold + 1) / math.log(50), 1.0)
     return [255, int(215 * (1 - t)), 0, 200]
 
 
@@ -104,18 +104,13 @@ def _cached_continuous_users(_conn, window_start_str, max_date):
     # this cache key changes and naturally refreshes itself as soon as new
     # usage data lands, with no explicit invalidation needed for this one.
     #
-    # Uses mode, not median, as "the continuous amount" — the recurring rate
-    # the meter keeps coming back to, rather than the midpoint of everything
-    # it did. Raw hourly gallons are floats and almost never repeat exactly
-    # (verified against this data: on raw readings, only ~10% of qualifying
-    # meters had any value repeat more than twice in a week), so the mode is
-    # taken on readings rounded to the nearest 10 gal/hr first — that alone
-    # resolved 922/926 meters (99.6%) to a single unambiguous mode in testing,
-    # each recurring 5-145 times across the week instead of 2-4. For the rare
-    # remaining tie (multiple bucketed values equally most-frequent), we take
-    # the smallest tied value — same conservative-default direction used
-    # elsewhere in this file. SQLite has no MODE() aggregate, so this pulls
-    # raw hourly rows and lets pandas do it.
+    # Uses the lowest hourly reading in the window as "the continuous
+    # amount" — every single hour this meter ran was at least this much, so
+    # it's a guaranteed floor on how bad the leak is. Previously used the
+    # mode (most frequently recurring rounded rate) instead, on the theory
+    # that it better represented the rate a meter "keeps coming back to" —
+    # in practice that produced bad results (see git history), so this went
+    # back to the simpler min.
     raw = pd.read_sql_query(
         "SELECT miu_id, consumption_with_multiplier AS gal "
         "FROM water_usage WHERE reading_date > ? AND reading_date <= ?",
@@ -124,16 +119,13 @@ def _cached_continuous_users(_conn, window_start_str, max_date):
     if raw.empty:
         return pd.DataFrame(columns=[
             "miu_id", "meter_number", "account_number", "customer_name",
-            "reading_count", "zero_count", "mode_consumption", "min_consumption",
+            "reading_count", "zero_count", "min_consumption",
             "total_consumption",
         ])
-
-    raw["bucket"] = (raw["gal"] / 10).round() * 10
 
     grouped = raw.groupby("miu_id").agg(
         reading_count=("gal", "count"),
         zero_count=("gal", lambda s: int((s.isna() | (s <= 0)).sum())),
-        mode_consumption=("bucket", lambda s: s.mode().min()),
         min_consumption=("gal", "min"),
         total_consumption=("gal", "sum"),
     ).reset_index()
@@ -149,7 +141,7 @@ def _cached_continuous_users(_conn, window_start_str, max_date):
     )
     return (
         qualifying.merge(meta, on="miu_id", how="left")
-        .sort_values("mode_consumption", ascending=False)
+        .sort_values("min_consumption", ascending=False)
         .reset_index(drop=True)
     )
 
@@ -482,10 +474,8 @@ with tab_continuous:
         "out meters with only a stray reading or two, which would otherwise look "
         "trivially \"continuous\"). This usually means water is running nonstop — "
         "a running toilet, a stuck irrigation valve, or a leak. Sorted by the "
-        "mode hourly amount during that window (readings rounded to the nearest "
-        "10 gal/hr, then the most frequently recurring value) — the rate this "
-        "meter keeps coming back to, not just its midpoint or its single lowest "
-        "reading."
+        "lowest hourly reading in that window — every hour this meter ran was "
+        "at least this much, so it's a guaranteed floor on how bad the leak is."
     )
 
     bounds = conn.execute(
@@ -523,7 +513,7 @@ with tab_continuous:
                 key="continuous_show_smaller",
             )
             threshold = 5 if show_smaller else 10
-            filtered = continuous[continuous["mode_consumption"] >= threshold]
+            filtered = continuous[continuous["min_consumption"] >= threshold]
             st.caption(
                 f"Showing meters with a continuous flow of at least **{threshold} gal/hr** — "
                 "below that, a nonstop trickle is more likely a slow drip than a leak worth "
@@ -543,7 +533,6 @@ with tab_continuous:
                         "account_number",
                         "meter_number",
                         "continuous_since",
-                        "mode_consumption",
                         "min_consumption",
                         "total_consumption",
                         "reading_count",
@@ -553,7 +542,6 @@ with tab_continuous:
                         "account_number": "account",
                         "meter_number": "meter",
                         "continuous_since": "continuous since",
-                        "mode_consumption": "continuous amount (mode, nearest 10 gal)",
                         "min_consumption": "lowest hourly reading",
                         "total_consumption": "total gallons this week",
                         "reading_count": "hourly readings",
@@ -563,14 +551,9 @@ with tab_continuous:
                     "\"continuous since\" is the last time this meter read zero, plus one "
                     "reading — everything after that has been nonstop. A **≥** date means "
                     "it's never once read zero in all our recorded history, so the real "
-                    "start may be earlier than we can see. \"Continuous amount\" is the mode: "
-                    "hourly readings are rounded to the nearest 10 gal/hr, then whichever "
-                    "rounded value recurs most often that week is shown — the rate this meter "
-                    "keeps coming back to. \"Lowest hourly reading\" is the single smallest raw "
-                    "reading in the window, shown for reference only — it's not what this list "
-                    "is sorted or filtered by, since one odd hour (a meter-timing artifact or "
-                    "an estimate later corrected to actual) could otherwise understate a "
-                    "steady leak."
+                    "start may be earlier than we can see. \"Lowest hourly reading\" is the "
+                    "single smallest raw reading in the window — what this list is sorted "
+                    "and filtered by, since every hour was at least that much."
                 )
                 st.caption("Click a row to see that meter's usage below.")
                 event = st.dataframe(
@@ -633,17 +616,17 @@ with tab_map:
         else:
             map_window_start = (pd.Timestamp(map_max_date) - pd.Timedelta(days=7)).isoformat()
             map_continuous = _cached_continuous_users(conn, map_window_start, map_max_date)
-            leak_by_meter = map_continuous.set_index("miu_id")["mode_consumption"]
+            leak_by_meter = map_continuous.set_index("miu_id")["min_consumption"]
 
         df = meter_parcels.copy()
-        df["mode_consumption"] = df["meter_id"].map(leak_by_meter)
-        df["is_leak"] = df["mode_consumption"] >= map_threshold
+        df["min_consumption"] = df["meter_id"].map(leak_by_meter)
+        df["is_leak"] = df["min_consumption"] >= map_threshold
         df["label"] = df["customer_name"].where(df["customer_name"].notna(), "(no billing match)")
         df["tooltip"] = df.apply(
             lambda r: (
                 f"{r['label']} — meter {r['meter_number']}"
                 + (
-                    f" · continuous {r['mode_consumption']:.0f} gal/hr"
+                    f" · continuous {r['min_consumption']:.0f} gal/hr"
                     if r["is_leak"] else ""
                 )
             ),
@@ -668,15 +651,10 @@ with tab_map:
                 rings = [part[0] for part in geom["coordinates"]]
             else:
                 continue
-            color = _leak_color(row["mode_consumption"] if row["is_leak"] else None, map_threshold)
+            color = _leak_color(row["min_consumption"] if row["is_leak"] else None, map_threshold)
             for ring in rings:
                 records.append({"polygon": ring, "fill_color": color, "tooltip": row["tooltip"]})
                 all_coords.extend(ring)
-
-        lons = [c[0] for c in all_coords]
-        lats = [c[1] for c in all_coords]
-        center_lat = (min(lats) + max(lats)) / 2 if lats else 41.7
-        center_lon = (min(lons) + max(lons)) / 2 if lons else -111.8
 
         layer = pdk.Layer(
             "PolygonLayer",
@@ -690,7 +668,19 @@ with tab_map:
             pickable=True,
             auto_highlight=True,
         )
-        view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=12.5)
+        # Fits the viewport to the bounding box of the matched parcels (i.e.
+        # Providence) instead of a hardcoded center/zoom, so the map still
+        # frames the town correctly if the parcel set changes. view_proportion
+        # drops the farthest 0.5% of ring points before fitting — a handful
+        # of parcels are matched to addresses in other Cache Valley towns
+        # (e.g. "269 E CENTER ST" landing ~20mi north, in what's almost
+        # certainly Smithfield's parcel data, not Providence's — see
+        # import_gis.py's address matching), and without trimming those the
+        # whole view zooms out to fit them instead of the town.
+        if all_coords:
+            view_state = pdk.data_utils.compute_view(all_coords, view_proportion=0.995)
+        else:
+            view_state = pdk.ViewState(latitude=41.7, longitude=-111.8, zoom=12.5)
         st.pydeck_chart(
             pdk.Deck(
                 layers=[layer],
