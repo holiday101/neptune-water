@@ -171,7 +171,17 @@ def run(geojson_path, conn=None):
     print(f"  {len(geocode_matches)} / {len(geocoded)} geocoded points fell inside a parcel")
 
     print("Falling back to address matching for the rest...")
-    exact_idx, prefix_idx = build_address_index(parcels_gdf)
+    # Scoped to DEFAULT_CITY, not the full parcels_gdf — this geojson covers
+    # the whole county (19 cities), and small Utah towns share a lot of grid
+    # addresses ("125 W CENTER ST", "150 W 200 S", ...). An address that
+    # doesn't exist under this exact normalized string in Providence's own
+    # data (which is exactly when this fallback runs) can still happen to be
+    # unique somewhere else in the county — found 21 meters this way matched
+    # to parcels in Logan/Smithfield/Mendon/etc. instead of going unmatched.
+    # The geocode step above isn't scoped like this because it's matching a
+    # real lat/lon against physical polygons, not a coincidental string hit.
+    providence_gdf = parcels_gdf[parcels_gdf["city"] == DEFAULT_CITY]
+    exact_idx, prefix_idx = build_address_index(providence_gdf)
     fallback_matches, fallback_method = {}, {}
     for meter_id, loc in billing.itertuples(index=False, name=None):
         if meter_id in geocode_matches:
