@@ -469,6 +469,26 @@ def replace_meter_parcels(conn, rows):
     conn.commit()
 
 
+def upsert_meter_parcels(conn, rows):
+    """rows: list of dicts with meter_id, parcel_id, match_method, lat, lon,
+    matched_at. Unlike replace_meter_parcels (full wipe, used by
+    import_gis.py's billing-address pass), this upserts just the given
+    meter_ids — used by import_meter_locations.py to layer higher-confidence
+    GPS-survey matches ('gis_survey') on top of the existing geocoded/
+    address-string matches, overriding a given meter_id's row only when the
+    survey actually covers it."""
+    now = _now()
+    conn.executemany(
+        "INSERT INTO meter_parcels (meter_id, parcel_id, match_method, lat, lon, matched_at) "
+        "VALUES (:meter_id, :parcel_id, :match_method, :lat, :lon, :matched_at) "
+        "ON CONFLICT(meter_id) DO UPDATE SET "
+        "parcel_id = excluded.parcel_id, match_method = excluded.match_method, "
+        "lat = excluded.lat, lon = excluded.lon, matched_at = excluded.matched_at",
+        [{**r, "matched_at": r.get("matched_at") or now} for r in rows],
+    )
+    conn.commit()
+
+
 def replace_gis_meters(conn, rows):
     """rows: list of dicts with meter_id, lat, lon, address, customer_name,
     meter_size, service_type, install_year, parcel_id, match_method,

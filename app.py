@@ -614,10 +614,16 @@ with tab_map:
         )
     else:
         total_meters = row_counts["customers"] or 1
+        gis_survey_n = int((meter_parcels["match_method"] == "gis_survey").sum())
         st.caption(
             f"{len(meter_parcels)} of {total_meters} meters ({len(meter_parcels) / total_meters:.0%}) "
-            "are matched to a parcel boundary and shown here — the rest couldn't be geocoded or "
-            "address-matched to a parcel (see `import_gis.py` / the README for how matching works)."
+            "are matched to a parcel boundary and shown here"
+            + (
+                f" — {gis_survey_n} from the GPS meter survey below (most reliable), the rest "
+                "geocoded or address-matched from billing addresses"
+                if gis_survey_n else " — geocoded or address-matched from billing addresses"
+            )
+            + " (see `import_gis.py` / `import_meter_locations.py` / the README for how matching works)."
         )
 
         show_smaller_map = st.toggle(

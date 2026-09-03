@@ -93,6 +93,8 @@ stated in the API docs.
 - `import_billing.py` — loads a billing-system spreadsheet export into `customer_billing`
 - `import_gis.py` — loads a county parcel GeoJSON export, geocodes billing addresses, and
   matches each meter to a parcel (see "GIS / parcel data" below)
+- `import_meter_locations.py` — loads the utility's own surveyed meter-location shapefile,
+  matches it to parcels directly, and upgrades `meter_parcels` with it (see below)
 - `app.py` — Streamlit UI (Customers, Water Usage, Sync & Backfill, Ask AI)
 - `data/neptune.db` — created on first run, gitignored
 
@@ -129,6 +131,43 @@ address — assume this utility's accounts are overwhelmingly in one city
 (verified against this data: ~1,700 of ~2,000 address matches were
 "Providence"). If you import a different utility's billing data, update
 those first.
+
+### Upgrading matches with a surveyed meter-location shapefile
+
+If you can get the utility's own meter-inventory GIS export (a shapefile
+with one point per physical meter, GPS-surveyed in the field — not
+geocoded from an address), it's more reliable than the billing-address
+matching above and worth importing on top of it:
+
+```bash
+python3 import_meter_locations.py "/path/to/WATER_Meter.zip"
+```
+
+Expects the fields Cache County/Providence's utility software exports:
+`MeterID`, `Lat`, `Long`, `LocationAd`, `CustomerNa`, plus a few others
+(see `load_meters()` in the script). Accepts a `.zip` of the four shapefile
+parts (`.shp`/`.shx`/`.dbf`/`.prj`) or a direct `.shp` path.
+
+Since these coordinates are real GPS points rather than geocoded addresses,
+matching to a parcel is a direct point-in-polygon join — no geocoder
+round-trip needed. Meters installed at the curb/property line (common)
+land just outside their parcel's polygon; a small nearest-parcel fallback
+(within 20m) catches those. On the first real run this got 100% of 2,476
+surveyed meters matched to a parcel.
+
+The script then reconciles this against Neptune's meters too: it
+normalized-address-matches `customer_billing` against the survey and, for
+every unique match, upserts a `gis_survey` row into `meter_parcels` —
+trusted over an existing geocoded/address-string match, not just used as a
+fallback, since it's grounded in a physical survey rather than a geocoder's
+guess. On the first real run this raised `meter_parcels` coverage from 83%
+to 97%, added matches for meters billing-address matching had missed
+entirely, and corrected several hundred cases where the geocoded parcel's
+own address didn't actually match the billing address.
+
+Results land in `gis_meters` (meter_id, lat, lon, address, customer_name,
+parcel_id, match_method — `within` or `nearest`, plus `match_dist_m`),
+fully replaced each run. Re-run whenever you get a fresh export.
 
 ## Ask AI tab
 

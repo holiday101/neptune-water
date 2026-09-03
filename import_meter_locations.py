@@ -16,20 +16,36 @@ Usage:
 Requires parcels to already be loaded (run import_gis.py first) — otherwise
 every meter comes back with parcel_id = NULL and a warning is printed.
 
+Also reconciles this survey against Neptune's own meters: customer_billing
+addresses are normalized-matched against gis_meters addresses (same
+normalization import_gis.py's fallback path uses), and wherever that's a
+unique match, the survey's parcel_id is written into meter_parcels as a new
+'gis_survey' match — layered on top of (and, on conflict, overriding)
+whatever import_gis.py's billing-address geocoding already found there. This
+is trusted over a geocoded match, not just used as another fallback, because
+it comes from an actual physical GPS survey of the meter rather than an
+address run through a geocoder: checked against this data, the survey's
+matched parcel address lines up with the billing address almost every time
+a geocoded match disagreed with it, while the geocoded parcel's address
+often didn't match at all (see the git history for a sampled comparison).
+
 Re-run any time you get a fresh meter-inventory export — gis_meters is fully
-replaced each run, same reasoning as parcels/meter_parcels in import_gis.py.
+replaced each run, same reasoning as parcels/meter_parcels in import_gis.py;
+the meter_parcels reconciliation re-upserts every 'gis_survey' row too.
 """
 import json
 import os
 import sys
 import tempfile
 import zipfile
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import shape
 
+import import_gis as gis
 import neptune_db as db
 
 # Parcel geometry (like everywhere else in this codebase) is stored in WGS84
@@ -146,6 +162,53 @@ def match_parcels(meters_df, conn):
     return result
 
 
+def match_customers_via_survey(conn):
+    """Matches customer_billing meters to gis_meters by normalized address,
+    and upserts a 'gis_survey' row into meter_parcels for every unique match
+    (skips an address that maps to more than one distinct parcel among
+    surveyed meters — same ambiguity-averse rule import_gis.py's fallback
+    string-matching uses). Returns stats for reporting."""
+    gis_rows = conn.execute(
+        "SELECT address, lat, lon, parcel_id FROM gis_meters WHERE parcel_id IS NOT NULL"
+    ).fetchall()
+    addr_to_parcels = defaultdict(set)
+    addr_to_latlon = {}
+    for r in gis_rows:
+        norm = gis._normalize_addr(r["address"])
+        if not norm:
+            continue
+        addr_to_parcels[norm].add(r["parcel_id"])
+        addr_to_latlon.setdefault(norm, (r["lat"], r["lon"]))
+
+    billing_rows = conn.execute(
+        "SELECT meter_id, location FROM customer_billing WHERE location IS NOT NULL"
+    ).fetchall()
+    existing = {r["meter_id"]: r["parcel_id"] for r in conn.execute("SELECT meter_id, parcel_id FROM meter_parcels")}
+
+    now = datetime.now(timezone.utc).isoformat()
+    survey_rows, new_count, upgraded_count = [], 0, 0
+    for r in billing_rows:
+        norm = gis._normalize_addr(r["location"])
+        parcels = addr_to_parcels.get(norm)
+        if not parcels or len(parcels) != 1:
+            continue
+        parcel_id = next(iter(parcels))
+        lat, lon = addr_to_latlon[norm]
+        survey_rows.append({
+            "meter_id": r["meter_id"], "parcel_id": parcel_id, "match_method": "gis_survey",
+            "lat": lat, "lon": lon, "matched_at": now,
+        })
+        prior = existing.get(r["meter_id"])
+        if prior is None:
+            new_count += 1
+        elif prior != parcel_id:
+            upgraded_count += 1
+
+    if survey_rows:
+        db.upsert_meter_parcels(conn, survey_rows)
+    return {"survey_matched": len(survey_rows), "new": new_count, "changed": upgraded_count}
+
+
 def run(shapefile_path, conn=None):
     conn = conn or db.get_conn()
 
@@ -164,7 +227,19 @@ def run(shapefile_path, conn=None):
 
     rows = meters_df.where(pd.notna(meters_df), None).to_dict("records")
     db.replace_gis_meters(conn, rows)
-    return {"total": total, "matched": int(matched)}
+
+    print("Matching customer_billing meters to the survey by address...")
+    reconcile = match_customers_via_survey(conn)
+    total_customers = conn.execute("SELECT COUNT(*) c FROM customers").fetchone()["c"]
+    total_matched = conn.execute("SELECT COUNT(*) c FROM meter_parcels").fetchone()["c"]
+    print(
+        f"  {reconcile['survey_matched']} customer_billing meters matched via survey address "
+        f"({reconcile['new']} newly matched, {reconcile['changed']} upgraded from a conflicting match)"
+    )
+    print(f"  meter_parcels now covers {total_matched} / {total_customers} meters "
+          f"({total_matched / total_customers:.1%})")
+
+    return {"total": total, "matched": int(matched), **reconcile}
 
 
 if __name__ == "__main__":
