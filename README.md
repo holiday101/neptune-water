@@ -73,11 +73,19 @@ far more than one day's budget.
 So:
 - **Sync Customers** — run this first, anytime. Cheap.
 - **Sync recent usage** — pulls the last few days for every meter. Small, safe to
-  run daily (e.g. via cron) to keep the data current going forward.
-- **Historical backfill** — resumable. Each click spends whatever's left of today's
-  budget, saves its progress (`sync_state` table), and picks up exactly where it
-  left off the next time you click it. The Sync tab shows an estimate of total calls
-  needed and roughly how many sessions that'll take before you start.
+  run daily (e.g. via cron) to keep the data current going forward. On the deployed
+  server this also fires automatically once whenever someone logs in (throttled to
+  once per 30 minutes across everyone, not per person — see "Keeping data fresh
+  automatically" below) — the daily cron keeps things current overnight, this just
+  tops it up during the day.
+- **Historical backfill** — resumable, and on the server this now runs itself on a
+  daily timer (see "One-time historical backfill" below) instead of needing someone
+  to click the button every day until it's done. The button in the Sync tab still
+  works too, if you want to nudge it along faster than once a day. Each run spends
+  whatever's left of today's budget, saves its progress (`sync_state` table), and
+  picks up exactly where it left off next time (button click or cron run alike). The
+  Sync tab shows an estimate of total calls needed and roughly how many sessions
+  that'll take.
 
 The app tracks every call it makes in `api_call_log` and refuses to exceed
 `NEPTUNE_DAILY_CALL_BUDGET` (default 480, a bit under Neptune's stated 500, to leave
@@ -94,11 +102,83 @@ Neptune's real quota. That's why Sync & Backfill is gated behind
 `NEPTUNE_ALLOW_SYNC` (default `false` — see "Public deployment" below): leave it
 off on every checkout except whichever one is actually meant to sync.
 
+### Keeping data fresh automatically
+
+Two unattended mechanisms, both only active where `NEPTUNE_ALLOW_SYNC=true`
+(the production server, not a local checkout):
+
+- **`sync_daily.py`** — a standalone script, unrelated to the app process,
+  meant to be run by cron/systemd once a day (the server runs it via
+  `neptune-sync.timer`, 05:00 MDT). Pulls customers + the last 3 days of
+  usage.
+- **Login-triggered top-up** — `app.py` also pulls the last 3 days of usage
+  once per session, right after someone logs in, throttled to once per 30
+  minutes *across every session*, not per person (tracked in `sync_state`,
+  key `auto_recent_usage_sync`) — so a wave of logins in the same few
+  minutes fires one real sync, not one each. This is what keeps the data
+  from going stale during the day between cron runs; it isn't a substitute
+  for the cron job (which also refreshes `customers`, which this doesn't).
+
+### One-time historical backfill
+
+```bash
+python3 backfill_once.py
+```
+
+Wraps the same resumable `start_or_resume_backfill()` the Sync tab's button
+uses, but meant to run once a day, unattended, until the whole ~2-year range
+is done — then every run after that is a no-op (checks a `sync_state` done
+marker first, prints "already completed", exits immediately). Picks up
+whatever backfill is already in progress (matches on the exact date range
+already stored in `sync_state`, same as the button) rather than starting
+over, so switching from clicking the button to cron-driving this script
+loses no progress.
+
+On the server this runs via `neptune-backfill.timer` (05:30 MDT, after
+`neptune-sync.timer`'s 05:00 recent-usage pull) — set up once with:
+
+```bash
+# /etc/systemd/system/neptune-backfill.service
+[Unit]
+Description=Neptune 360 one-time historical backfill (resumable, no-ops once done)
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/neptune-water
+ExecStart=/home/ubuntu/neptune-water/.venv/bin/python3 backfill_once.py
+
+# /etc/systemd/system/neptune-backfill.timer
+[Unit]
+Description=Run the Neptune historical backfill once a day until it's done
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now neptune-backfill.timer
+```
+
+Check progress any time with `journalctl -u neptune-backfill.service` or by
+querying `sync_state` for the `water_usage_backfill` key (cursor position)
+or `water_usage_backfill_once_done` (set once it's finished).
+
 ## Files
 
 - `neptune_client.py` — auth + raw API calls, budget-enforced, retries on transient 5xx/timeout
 - `neptune_db.py` — SQLite schema, upserts, call log, resumable sync-state store
 - `neptune_sync.py` — sync orchestration (customers, recent usage, backfill, ranked deep-dive)
+- `sync_daily.py` — standalone daily cron script: customers + last 3 days of usage
+- `backfill_once.py` — standalone daily cron script: resumable historical backfill,
+  no-ops once complete (see "One-time historical backfill" below)
 - `import_billing.py` — loads a billing-system spreadsheet export into `customer_billing`
 - `import_gis.py` — loads a county parcel GeoJSON export, geocodes billing addresses, and
   matches each meter to a parcel (see "GIS / parcel data" below)

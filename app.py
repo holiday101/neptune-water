@@ -8,7 +8,7 @@ import math
 import os
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pydeck as pdk
@@ -330,8 +330,50 @@ def _locked_message(tab_label, required_role):
     st.caption("Log out and sign in with an account that has access.")
 
 
+# Keeps water usage roughly current between sync_daily.py's nightly cron runs
+# by pulling the last few days once per session, right after login — a top-up
+# for "I checked this app mid-afternoon and it's still showing this morning's
+# numbers", not a replacement for the cron job. Throttled via sync_state
+# (not just st.session_state) so a burst of logins in the same few minutes
+# only fires one real sync, not one per visitor. Only does anything at all
+# where NEPTUNE_ALLOW_SYNC is on — same reasoning as the Sync tab gate below:
+# this app's budget tracking is per-database, so this must stay off on any
+# machine that isn't the one deployment meant to be hitting Neptune's API.
+AUTO_SYNC_MIN_INTERVAL_MIN = 30
+AUTO_SYNC_STATE_KEY = "auto_recent_usage_sync"
+
+
+def _maybe_auto_sync_recent_usage(conn):
+    if not ALLOW_SYNC or st.session_state.get("auto_sync_checked"):
+        return
+    st.session_state.auto_sync_checked = True
+
+    last = db.get_sync_state(conn, AUTO_SYNC_STATE_KEY)
+    if last:
+        elapsed_min = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(last["synced_at"])
+        ).total_seconds() / 60
+        if elapsed_min < AUTO_SYNC_MIN_INTERVAL_MIN:
+            return
+
+    try:
+        client = NeptuneClient(conn=conn)
+        rows = sync.sync_water_usage_recent(client, days=3)
+        db.set_sync_state(
+            conn, AUTO_SYNC_STATE_KEY,
+            {"synced_at": datetime.now(timezone.utc).isoformat(), "rows": rows},
+        )
+        st.cache_data.clear()
+        if rows:
+            st.toast(f"Refreshed water usage — {rows} new readings.", icon="💧")
+    except (KeyError, NeptuneAPIError, BudgetExceeded):
+        pass  # best-effort — a sync hiccup should never block someone from using the app
+
+
 if PUBLIC_MODE and not _check_password():
     st.stop()
+
+_maybe_auto_sync_recent_usage(conn)
 
 _role = "global" if not PUBLIC_MODE else st.session_state.get("role", "viewer")
 IS_ADMIN = ROLE_RANK.get(_role, -1) >= ROLE_RANK["admin"]
