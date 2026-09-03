@@ -141,12 +141,37 @@ CREATE TABLE IF NOT EXISTS meter_parcels (
     matched_at     TEXT
 );
 
+-- The utility's own meter-inventory GIS layer (see import_meter_locations.py)
+-- — a shapefile export with a surveyed lat/lon per physical meter. meter_id
+-- here is the utility's internal asset ID ('MeterID' in the shapefile), NOT
+-- Neptune's miu_id/meter_number — the two ID spaces don't overlap (checked:
+-- 9 coincidental matches out of ~2,650), so this table stands alone rather
+-- than joining to customers/customer_billing. parcel_id comes from a direct
+-- point-in-polygon match against the already-imported `parcels` table using
+-- the surveyed coordinates — no geocoding needed since these are real GPS
+-- points, not addresses.
+CREATE TABLE IF NOT EXISTS gis_meters (
+    meter_id      TEXT PRIMARY KEY,
+    lat           REAL NOT NULL,
+    lon           REAL NOT NULL,
+    address       TEXT,
+    customer_name TEXT,
+    meter_size    TEXT,
+    service_type  TEXT,
+    install_year  INTEGER,
+    parcel_id     TEXT,
+    match_method  TEXT,
+    match_dist_m  REAL,
+    imported_at   TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_water_usage_miu ON water_usage(miu_id);
 CREATE INDEX IF NOT EXISTS idx_water_usage_date ON water_usage(reading_date);
 CREATE INDEX IF NOT EXISTS idx_customers_account ON customers(account_number);
 CREATE INDEX IF NOT EXISTS idx_billing_account ON customer_billing(account_number);
 CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users(email);
 CREATE INDEX IF NOT EXISTS idx_meter_parcels_parcel ON meter_parcels(parcel_id);
+CREATE INDEX IF NOT EXISTS idx_gis_meters_parcel ON gis_meters(parcel_id);
 """
 
 PBKDF2_ITERATIONS = 200_000
@@ -440,5 +465,22 @@ def replace_meter_parcels(conn, rows):
         "INSERT INTO meter_parcels (meter_id, parcel_id, match_method, lat, lon, matched_at) "
         "VALUES (:meter_id, :parcel_id, :match_method, :lat, :lon, :matched_at)",
         rows,
+    )
+    conn.commit()
+
+
+def replace_gis_meters(conn, rows):
+    """rows: list of dicts with meter_id, lat, lon, address, customer_name,
+    meter_size, service_type, install_year, parcel_id, match_method,
+    match_dist_m. Full replace each run (see import_meter_locations.py) —
+    same reasoning as replace_parcels."""
+    now = _now()
+    conn.execute("DELETE FROM gis_meters")
+    conn.executemany(
+        "INSERT INTO gis_meters (meter_id, lat, lon, address, customer_name, meter_size, "
+        "service_type, install_year, parcel_id, match_method, match_dist_m, imported_at) "
+        "VALUES (:meter_id, :lat, :lon, :address, :customer_name, :meter_size, "
+        ":service_type, :install_year, :parcel_id, :match_method, :match_dist_m, :imported_at)",
+        [{**r, "imported_at": now} for r in rows],
     )
     conn.commit()

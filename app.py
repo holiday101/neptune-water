@@ -193,6 +193,26 @@ def _cached_meter_parcels(_conn):
         _conn,
     )
 
+
+@st.cache_data
+def _cached_gis_meters(_conn):
+    """Surveyed meter locations from the utility's own GIS export (see
+    import_meter_locations.py) — a different source and ID space from
+    meter_parcels above (that one matches Neptune meters via billing-address
+    geocoding; this one is the utility's own asset inventory, matched to a
+    parcel directly from its surveyed GPS coordinate). Not joined to
+    customers/water_usage since meter_id here doesn't line up with miu_id."""
+    return pd.read_sql_query(
+        """
+        SELECT g.meter_id, g.lat, g.lon, g.address, g.customer_name,
+               g.meter_size, g.parcel_id, g.match_method, g.match_dist_m,
+               p.geometry AS parcel_geometry
+        FROM gis_meters g
+        LEFT JOIN parcels p ON p.parcel_id = g.parcel_id
+        """,
+        _conn,
+    )
+
 # PUBLIC_MODE gates the whole app behind per-user email/password login, for
 # deployments meant to be reachable from the open internet. Three-tier role
 # ladder (see app_users table in neptune_db.py):
@@ -695,6 +715,98 @@ with tab_map:
             f"🟡🟠🔴 currently continuous ≥ {map_threshold} gal/hr this week (darker red = higher rate) "
             "· 🔵 no continuous leak this week"
         )
+
+    st.divider()
+    st.subheader("📍 GIS meter survey")
+    gis_meters = _cached_gis_meters(conn)
+    if gis_meters.empty:
+        st.info(
+            "No GIS meter survey loaded yet. Run `python3 import_meter_locations.py "
+            "\"<path to meter shapefile .zip or .shp>\"` to load surveyed meter locations "
+            "and match them to parcels."
+        )
+    else:
+        gis_matched = gis_meters["parcel_id"].notna().sum()
+        st.caption(
+            f"{len(gis_meters)} meters from the utility's own GIS survey (`import_meter_locations.py`), "
+            f"{gis_matched} ({gis_matched / len(gis_meters):.0%}) matched to a parcel from their surveyed "
+            "GPS coordinate — independent of the billing-address matching above. meter_id here is the "
+            "utility's internal asset ID, not Neptune's miu_id, so these aren't joined to usage data."
+        )
+
+        # Parcel polygons: one ring set per distinct matched parcel, not per
+        # meter — several meters commonly share a parcel (e.g. an HOA or
+        # multi-unit property), and drawing the same polygon repeatedly would
+        # just be wasted layer records.
+        matched_parcels = (
+            gis_meters.dropna(subset=["parcel_id", "parcel_geometry"])
+            .drop_duplicates("parcel_id")
+        )
+        parcel_records, all_coords = [], []
+        for _, row in matched_parcels.iterrows():
+            geom = json.loads(row["parcel_geometry"])
+            if geom["type"] == "Polygon":
+                rings = [geom["coordinates"][0]]
+            elif geom["type"] == "MultiPolygon":
+                rings = [part[0] for part in geom["coordinates"]]
+            else:
+                continue
+            for ring in rings:
+                parcel_records.append({"polygon": ring})
+                all_coords.extend(ring)
+
+        parcel_layer = pdk.Layer(
+            "PolygonLayer",
+            parcel_records,
+            get_polygon="polygon",
+            get_fill_color=[70, 130, 220, 40],
+            get_line_color=[70, 130, 220, 160],
+            filled=True,
+            stroked=True,
+            line_width_min_pixels=1,
+        )
+
+        gis_meters = gis_meters.copy()
+        gis_meters["customer_label"] = gis_meters["customer_name"].where(
+            gis_meters["customer_name"].notna(), "(no name on file)"
+        )
+        gis_meters["tooltip"] = gis_meters.apply(
+            lambda r: (
+                f"{r['customer_label']} — meter {r['meter_id']}"
+                + (f" · parcel {r['parcel_id']}" if pd.notna(r["parcel_id"]) else " · no parcel match")
+                + (f" · {r['address']}" if pd.notna(r["address"]) else "")
+            ),
+            axis=1,
+        )
+        meter_layer = pdk.Layer(
+            "ScatterplotLayer",
+            gis_meters,
+            get_position="[lon, lat]",
+            get_fill_color=[220, 20, 60, 200],
+            get_radius=6,
+            radius_min_pixels=3,
+            radius_max_pixels=8,
+            pickable=True,
+            auto_highlight=True,
+        )
+
+        all_coords.extend(zip(gis_meters["lon"], gis_meters["lat"]))
+        if all_coords:
+            gis_view_state = pdk.data_utils.compute_view(all_coords, view_proportion=0.995)
+        else:
+            gis_view_state = pdk.ViewState(latitude=41.7, longitude=-111.8, zoom=12.5)
+
+        st.pydeck_chart(
+            pdk.Deck(
+                layers=[parcel_layer, meter_layer],
+                initial_view_state=gis_view_state,
+                tooltip={"html": "{tooltip}"},
+                map_style=None,
+            ),
+            width="stretch",
+            height=500,
+        )
+        st.caption("🔴 surveyed meter location · 🔵 outline = its matched parcel boundary")
 
 # --------------------------------------------------------- Manage Users --
 with tab_users:
