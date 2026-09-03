@@ -658,25 +658,48 @@ with tab_continuous:
                     )
 
 # ------------------------------------------------------------------ Map --
+# One combined map instead of two: parcels colored by leak status (from
+# meter_parcels, the billing-address-matched set) as the base layer, plus
+# the utility's own GPS-surveyed meter locations (gis_meters) as red dots on
+# top. Parcels that only the GIS survey matched (no billing/meter_parcels
+# link, so no leak data to color them by) are still drawn, in neutral blue,
+# so survey coverage doesn't disappear just because it merged into one map.
 with tab_map:
-    st.subheader("Meter map")
+    st.subheader("🗺️ Meter map")
     meter_parcels = _cached_meter_parcels(conn)
-    if meter_parcels.empty:
+    gis_meters = _cached_gis_meters(conn)
+
+    if meter_parcels.empty and gis_meters.empty:
         st.info(
-            "No parcel matches yet. Run `python3 import_gis.py \"<path to parcels.geojson>\"` "
-            "to load parcel boundaries and match them to meters."
+            "No parcel or meter-location data yet. Run "
+            "`python3 import_gis.py \"<path to parcels.geojson>\"` to load parcel boundaries "
+            "and match them to meters, and/or `python3 import_meter_locations.py "
+            "\"<path to meter shapefile .zip or .shp>\"` to load surveyed meter locations."
         )
     else:
         total_meters = row_counts["customers"] or 1
-        gis_survey_n = int((meter_parcels["match_method"] == "gis_survey").sum())
-        st.caption(
-            f"{len(meter_parcels)} of {total_meters} meters ({len(meter_parcels) / total_meters:.0%}) "
-            "are matched to a parcel boundary and shown here"
-            + (
-                f" — {gis_survey_n} from the GPS meter survey below (most reliable), the rest "
-                "geocoded or address-matched from billing addresses"
-                if gis_survey_n else " — geocoded or address-matched from billing addresses"
+        gis_survey_n = int((meter_parcels["match_method"] == "gis_survey").sum()) if not meter_parcels.empty else 0
+        caption_bits = []
+        if not meter_parcels.empty:
+            caption_bits.append(
+                f"{len(meter_parcels)} of {total_meters} meters ({len(meter_parcels) / total_meters:.0%}) "
+                "are matched to a parcel boundary"
+                + (
+                    f" — {gis_survey_n} from the GPS meter survey (most reliable), the rest "
+                    "geocoded or address-matched from billing addresses"
+                    if gis_survey_n else " — geocoded or address-matched from billing addresses"
+                )
             )
+        if not gis_meters.empty:
+            gis_matched = gis_meters["parcel_id"].notna().sum()
+            caption_bits.append(
+                f"{len(gis_meters)} meters from the utility's own GIS survey are plotted as red dots "
+                f"({gis_matched} of them ({gis_matched / len(gis_meters):.0%}) also matched to a parcel "
+                "from their surveyed GPS coordinate — meter_id there is the utility's internal asset ID, "
+                "not Neptune's miu_id, so those aren't joined to usage data)"
+            )
+        st.caption(
+            ". ".join(caption_bits)
             + " (see `import_gis.py` / `import_meter_locations.py` / the README for how matching works)."
         )
 
@@ -691,29 +714,13 @@ with tab_map:
         map_max_date = map_bounds["m"] if map_bounds else None
 
         if not map_max_date:
-            st.info("No water usage data yet — showing parcels with no leak status.")
+            if not meter_parcels.empty:
+                st.info("No water usage data yet — showing parcels with no leak status.")
             leak_by_meter = pd.Series(dtype=float)
         else:
             map_window_start = (pd.Timestamp(map_max_date) - pd.Timedelta(days=7)).isoformat()
             map_continuous = _cached_continuous_users(conn, map_window_start, map_max_date)
             leak_by_meter = map_continuous.set_index("miu_id")["min_consumption"]
-
-        df = meter_parcels.copy()
-        df["min_consumption"] = df["meter_id"].map(leak_by_meter)
-        df["is_leak"] = df["min_consumption"] >= map_threshold
-        df["label"] = df["customer_name"].where(df["customer_name"].notna(), "(no billing match)")
-        df["tooltip"] = df.apply(
-            lambda r: (
-                f"{r['label']} — meter {r['meter_number']}"
-                + (
-                    f" · continuous {r['min_consumption']:.0f} gal/hr"
-                    if r["is_leak"] else ""
-                )
-            ),
-            axis=1,
-        )
-
-        df["geom_obj"] = df["geometry"].apply(json.loads)
 
         # PolygonLayer with flat per-ring records, not GeoJsonLayer — the
         # deck.gl runtime Streamlit bundles turned out not to render
@@ -721,152 +728,135 @@ with tab_map:
         # "properties.x") at all in testing, silently or with a parse error
         # depending on syntax. Flat top-level dict keys are the pattern
         # Streamlit's own pydeck examples use, and did render correctly.
-        records = []
-        all_coords = []
-        for _, row in df.iterrows():
-            geom = row["geom_obj"]
-            if geom["type"] == "Polygon":
-                rings = [geom["coordinates"][0]]
-            elif geom["type"] == "MultiPolygon":
-                rings = [part[0] for part in geom["coordinates"]]
-            else:
-                continue
-            color = _leak_color(row["min_consumption"] if row["is_leak"] else None, map_threshold)
-            for ring in rings:
-                records.append({"polygon": ring, "fill_color": color, "tooltip": row["tooltip"]})
-                all_coords.extend(ring)
+        records, all_coords, seen_parcel_ids = [], [], set()
 
-        layer = pdk.Layer(
-            "PolygonLayer",
-            records,
-            get_polygon="polygon",
-            get_fill_color="fill_color",
-            get_line_color=[80, 80, 80, 150],
-            filled=True,
-            stroked=True,
-            line_width_min_pixels=1,
-            pickable=True,
-            auto_highlight=True,
-        )
-        # Fits the viewport to the bounding box of the matched parcels (i.e.
+        if not meter_parcels.empty:
+            df = meter_parcels.copy()
+            df["min_consumption"] = df["meter_id"].map(leak_by_meter)
+            df["is_leak"] = df["min_consumption"] >= map_threshold
+            df["label"] = df["customer_name"].where(df["customer_name"].notna(), "(no billing match)")
+            df["tooltip"] = df.apply(
+                lambda r: (
+                    f"{r['label']} — meter {r['meter_number']}"
+                    + (
+                        f" · continuous {r['min_consumption']:.0f} gal/hr"
+                        if r["is_leak"] else ""
+                    )
+                ),
+                axis=1,
+            )
+            df["geom_obj"] = df["geometry"].apply(json.loads)
+            for _, row in df.iterrows():
+                geom = row["geom_obj"]
+                if geom["type"] == "Polygon":
+                    rings = [geom["coordinates"][0]]
+                elif geom["type"] == "MultiPolygon":
+                    rings = [part[0] for part in geom["coordinates"]]
+                else:
+                    continue
+                color = _leak_color(row["min_consumption"] if row["is_leak"] else None, map_threshold)
+                for ring in rings:
+                    records.append({"polygon": ring, "fill_color": color, "tooltip": row["tooltip"]})
+                    all_coords.extend(ring)
+                seen_parcel_ids.add(row["parcel_id"])
+
+        if not gis_meters.empty:
+            # One ring set per distinct matched parcel, not per meter —
+            # several meters commonly share a parcel (e.g. an HOA or
+            # multi-unit property) — and skip any parcel already drawn above
+            # from meter_parcels, so it isn't rendered twice with two colors
+            # stacked on top of each other.
+            matched_parcels = (
+                gis_meters.dropna(subset=["parcel_id", "parcel_geometry"])
+                .drop_duplicates("parcel_id")
+            )
+            for _, row in matched_parcels.iterrows():
+                if row["parcel_id"] in seen_parcel_ids:
+                    continue
+                geom = json.loads(row["parcel_geometry"])
+                if geom["type"] == "Polygon":
+                    rings = [geom["coordinates"][0]]
+                elif geom["type"] == "MultiPolygon":
+                    rings = [part[0] for part in geom["coordinates"]]
+                else:
+                    continue
+                for ring in rings:
+                    records.append({
+                        "polygon": ring, "fill_color": [70, 130, 220, 40],
+                        "tooltip": f"Parcel {row['parcel_id']} (GIS survey only, no billing match)",
+                    })
+                    all_coords.extend(ring)
+
+        layers = []
+        if records:
+            layers.append(pdk.Layer(
+                "PolygonLayer",
+                records,
+                get_polygon="polygon",
+                get_fill_color="fill_color",
+                get_line_color=[80, 80, 80, 150],
+                filled=True,
+                stroked=True,
+                line_width_min_pixels=1,
+                pickable=True,
+                auto_highlight=True,
+            ))
+
+        if not gis_meters.empty:
+            gis_meters = gis_meters.copy()
+            gis_meters["customer_label"] = gis_meters["customer_name"].where(
+                gis_meters["customer_name"].notna(), "(no name on file)"
+            )
+            gis_meters["tooltip"] = gis_meters.apply(
+                lambda r: (
+                    f"📍 {r['customer_label']} — meter {r['meter_id']}"
+                    + (f" · parcel {r['parcel_id']}" if pd.notna(r["parcel_id"]) else " · no parcel match")
+                    + (f" · {r['address']}" if pd.notna(r["address"]) else "")
+                ),
+                axis=1,
+            )
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                gis_meters,
+                get_position="[lon, lat]",
+                get_fill_color=[220, 20, 60, 200],
+                get_radius=6,
+                radius_min_pixels=3,
+                radius_max_pixels=8,
+                pickable=True,
+                auto_highlight=True,
+            ))
+            all_coords.extend(zip(gis_meters["lon"], gis_meters["lat"]))
+
+        # Fits the viewport to the bounding box of everything plotted (i.e.
         # Providence) instead of a hardcoded center/zoom, so the map still
-        # frames the town correctly if the parcel set changes. view_proportion
-        # drops the farthest 0.5% of ring points before fitting — a handful
-        # of parcels are matched to addresses in other Cache Valley towns
-        # (e.g. "269 E CENTER ST" landing ~20mi north, in what's almost
-        # certainly Smithfield's parcel data, not Providence's — see
-        # import_gis.py's address matching), and without trimming those the
-        # whole view zooms out to fit them instead of the town.
+        # frames the town correctly if the parcel/survey set changes.
+        # view_proportion drops the farthest 0.5% of points before fitting —
+        # a handful of parcels are matched to addresses in other Cache
+        # Valley towns (e.g. "269 E CENTER ST" landing ~20mi north, in
+        # what's almost certainly Smithfield's parcel data, not
+        # Providence's — see import_gis.py's address matching), and without
+        # trimming those the whole view zooms out to fit them instead of
+        # the town.
         if all_coords:
             view_state = pdk.data_utils.compute_view(all_coords, view_proportion=0.995)
         else:
             view_state = pdk.ViewState(latitude=41.7, longitude=-111.8, zoom=12.5)
         st.pydeck_chart(
             pdk.Deck(
-                layers=[layer],
+                layers=layers,
                 initial_view_state=view_state,
                 tooltip={"html": "{tooltip}"},
                 map_style=None,
             ),
             width="stretch",
-            height=500,
+            height=600,
         )
         st.caption(
             f"🟡🟠🔴 currently continuous ≥ {map_threshold} gal/hr this week (darker red = higher rate) "
-            "· 🔵 no continuous leak this week"
+            "· 🔵 no continuous leak this week (darker blue = GIS-survey-only parcel, no billing match) "
+            "· 🔴 dot = surveyed meter location from the utility's GIS survey"
         )
-
-    st.divider()
-    st.subheader("📍 GIS meter survey")
-    gis_meters = _cached_gis_meters(conn)
-    if gis_meters.empty:
-        st.info(
-            "No GIS meter survey loaded yet. Run `python3 import_meter_locations.py "
-            "\"<path to meter shapefile .zip or .shp>\"` to load surveyed meter locations "
-            "and match them to parcels."
-        )
-    else:
-        gis_matched = gis_meters["parcel_id"].notna().sum()
-        st.caption(
-            f"{len(gis_meters)} meters from the utility's own GIS survey (`import_meter_locations.py`), "
-            f"{gis_matched} ({gis_matched / len(gis_meters):.0%}) matched to a parcel from their surveyed "
-            "GPS coordinate — independent of the billing-address matching above. meter_id here is the "
-            "utility's internal asset ID, not Neptune's miu_id, so these aren't joined to usage data."
-        )
-
-        # Parcel polygons: one ring set per distinct matched parcel, not per
-        # meter — several meters commonly share a parcel (e.g. an HOA or
-        # multi-unit property), and drawing the same polygon repeatedly would
-        # just be wasted layer records.
-        matched_parcels = (
-            gis_meters.dropna(subset=["parcel_id", "parcel_geometry"])
-            .drop_duplicates("parcel_id")
-        )
-        parcel_records, all_coords = [], []
-        for _, row in matched_parcels.iterrows():
-            geom = json.loads(row["parcel_geometry"])
-            if geom["type"] == "Polygon":
-                rings = [geom["coordinates"][0]]
-            elif geom["type"] == "MultiPolygon":
-                rings = [part[0] for part in geom["coordinates"]]
-            else:
-                continue
-            for ring in rings:
-                parcel_records.append({"polygon": ring})
-                all_coords.extend(ring)
-
-        parcel_layer = pdk.Layer(
-            "PolygonLayer",
-            parcel_records,
-            get_polygon="polygon",
-            get_fill_color=[70, 130, 220, 40],
-            get_line_color=[70, 130, 220, 160],
-            filled=True,
-            stroked=True,
-            line_width_min_pixels=1,
-        )
-
-        gis_meters = gis_meters.copy()
-        gis_meters["customer_label"] = gis_meters["customer_name"].where(
-            gis_meters["customer_name"].notna(), "(no name on file)"
-        )
-        gis_meters["tooltip"] = gis_meters.apply(
-            lambda r: (
-                f"{r['customer_label']} — meter {r['meter_id']}"
-                + (f" · parcel {r['parcel_id']}" if pd.notna(r["parcel_id"]) else " · no parcel match")
-                + (f" · {r['address']}" if pd.notna(r["address"]) else "")
-            ),
-            axis=1,
-        )
-        meter_layer = pdk.Layer(
-            "ScatterplotLayer",
-            gis_meters,
-            get_position="[lon, lat]",
-            get_fill_color=[220, 20, 60, 200],
-            get_radius=6,
-            radius_min_pixels=3,
-            radius_max_pixels=8,
-            pickable=True,
-            auto_highlight=True,
-        )
-
-        all_coords.extend(zip(gis_meters["lon"], gis_meters["lat"]))
-        if all_coords:
-            gis_view_state = pdk.data_utils.compute_view(all_coords, view_proportion=0.995)
-        else:
-            gis_view_state = pdk.ViewState(latitude=41.7, longitude=-111.8, zoom=12.5)
-
-        st.pydeck_chart(
-            pdk.Deck(
-                layers=[parcel_layer, meter_layer],
-                initial_view_state=gis_view_state,
-                tooltip={"html": "{tooltip}"},
-                map_style=None,
-            ),
-            width="stretch",
-            height=500,
-        )
-        st.caption("🔴 surveyed meter location · 🔵 outline = its matched parcel boundary")
 
 # --------------------------------------------------------- Manage Users --
 with tab_users:

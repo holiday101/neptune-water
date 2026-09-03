@@ -33,7 +33,6 @@ Re-run any time you get a fresh meter-inventory export — gis_meters is fully
 replaced each run, same reasoning as parcels/meter_parcels in import_gis.py;
 the meter_parcels reconciliation re-upserts every 'gis_survey' row too.
 """
-import json
 import os
 import sys
 import tempfile
@@ -43,24 +42,20 @@ from datetime import datetime, timezone
 
 import geopandas as gpd
 import pandas as pd
-from shapely.geometry import shape
 
 import import_gis as gis
 import neptune_db as db
 
-# Parcel geometry (like everywhere else in this codebase) is stored in WGS84
-# (EPSG:4326), whose coordinates are degrees — not usable for a real-world
-# distance threshold. AREA_CRS from import_gis.py (UTM zone 12N) covers this
-# same county, so reuse it here for the nearest-parcel fallback below.
-DIST_CRS = "EPSG:32612"
-
 # Meters are typically installed at the curb/property line, not inside the
-# parcel polygon itself, so a strict point-in-polygon join misses a real
-# chunk of otherwise-good GPS points. Checked against this data: every
-# unmatched point after the strict join was within 12.7m of a parcel (median
-# 3.3m) — so a small buffer recovers those without risking a false match
-# onto some unrelated, merely-nearby parcel across a street.
-NEAREST_FALLBACK_MAX_M = 20
+# parcel polygon itself — plus a strict point-in-polygon join is never going
+# to succeed at all for a meter that (very commonly) sits inside a road
+# right-of-way polygon, since those are excluded from matching entirely (see
+# import_gis.addressed_parcels_gdf — a parcel with no address is a road, not
+# a lot). match_points_to_parcels handles both cases the same way: nearest
+# addressed parcel wins. No distance cap — printed below instead as a
+# sanity check, since a genuinely bad GPS point should still show up as an
+# outlier rather than silently going unmatched.
+FAR_MATCH_WARN_M = 100
 
 
 def _read_shapefile(path):
@@ -104,60 +99,36 @@ def load_meters(path):
 
 
 def match_parcels(meters_df, conn):
-    """Point-in-polygon join of each meter's surveyed lat/lon against the
-    parcels table, with a small-buffer nearest-parcel fallback for meters
-    that sit just outside every polygon (curb-side installs — see
-    NEAREST_FALLBACK_MAX_M above). Returns meters_df with parcel_id,
+    """Matches each meter's surveyed lat/lon to the closest parcel that
+    isn't a road (point-in-polygon first, nearest-parcel fallback — see
+    gis.match_points_to_parcels). Returns meters_df with parcel_id,
     match_method ('within' or 'nearest'), and match_dist_m added (0.0 for
     'within', the actual distance for 'nearest', NaN/None for no match)."""
-    parcel_rows = conn.execute("SELECT parcel_id, geometry FROM parcels").fetchall()
-    if not parcel_rows:
-        print("  WARNING: parcels table is empty — run import_gis.py first. "
+    addressed_gdf = gis.addressed_parcels_gdf(conn)
+    if addressed_gdf.empty:
+        print("  WARNING: no addressed parcels found — run import_gis.py first. "
               "All meters will be stored with parcel_id = NULL.")
         return meters_df.assign(parcel_id=pd.NA, match_method=pd.NA, match_dist_m=pd.NA)
 
-    parcels_gdf = gpd.GeoDataFrame(
-        {"parcel_id": [r["parcel_id"] for r in parcel_rows]},
-        geometry=[shape(json.loads(r["geometry"])) for r in parcel_rows],
-        crs="EPSG:4326",
-    )
     points_gdf = gpd.GeoDataFrame(
         meters_df,
         geometry=gpd.points_from_xy(meters_df["lon"], meters_df["lat"]),
         crs="EPSG:4326",
     )
-
-    within = gpd.sjoin(points_gdf, parcels_gdf, how="left", predicate="within")
-    # A point exactly on a shared boundary can match more than one polygon;
-    # sjoin duplicates the row in that case — keep just the first match.
-    within = within[~within.index.duplicated(keep="first")]
-
+    match = gis.match_points_to_parcels(points_gdf, addressed_gdf)
     result = meters_df.assign(
-        parcel_id=within["parcel_id"].values,
-        match_method=pd.Series(within["parcel_id"].values).notna().map({True: "within", False: None}).values,
-        match_dist_m=within["parcel_id"].notna().astype(float).values * 0.0,
+        parcel_id=match["parcel_id"].values,
+        match_method=match["match_method"].values,
+        match_dist_m=match["match_dist_m"].values,
     )
-    result.loc[result["parcel_id"].isna(), "match_dist_m"] = pd.NA
 
-    unmatched_mask = result["parcel_id"].isna()
-    if unmatched_mask.any():
-        parcels_m = parcels_gdf.to_crs(DIST_CRS)
-        unmatched_pts = gpd.GeoDataFrame(
-            result.loc[unmatched_mask],
-            geometry=points_gdf.loc[unmatched_mask, "geometry"].values,
-            crs="EPSG:4326",
-        ).to_crs(DIST_CRS)
-
-        nearest = gpd.sjoin_nearest(
-            unmatched_pts[["geometry"]], parcels_m[["parcel_id", "geometry"]],
-            distance_col="dist_m",
-        )
-        nearest = nearest[~nearest.index.duplicated(keep="first")]
-        close_enough = nearest[nearest["dist_m"] <= NEAREST_FALLBACK_MAX_M]
-
-        result.loc[close_enough.index, "parcel_id"] = close_enough["parcel_id"].values
-        result.loc[close_enough.index, "match_method"] = "nearest"
-        result.loc[close_enough.index, "match_dist_m"] = close_enough["dist_m"].values
+    far = result[pd.to_numeric(result["match_dist_m"], errors="coerce") > FAR_MATCH_WARN_M]
+    if not far.empty:
+        print(f"  NOTE: {len(far)} meters matched to their nearest parcel from more than "
+              f"{FAR_MATCH_WARN_M}m away — worth a manual look (bad GPS point? sparse parcel "
+              "data nearby?):")
+        for _, r in far.iterrows():
+            print(f"    meter {r['meter_id']}: {r['match_dist_m']:.0f}m to parcel {r['parcel_id']}")
 
     return result
 
@@ -216,8 +187,7 @@ def run(shapefile_path, conn=None):
     meters_df = load_meters(shapefile_path)
     print(f"  {len(meters_df)} meters with a valid surveyed location")
 
-    print("Matching to parcels (point-in-polygon, nearest-parcel fallback within "
-          f"{NEAREST_FALLBACK_MAX_M}m)...")
+    print("Matching to the closest non-road parcel (point-in-polygon, nearest-parcel fallback)...")
     meters_df = match_parcels(meters_df, conn)
     matched = meters_df["parcel_id"].notna().sum()
     total = len(meters_df)

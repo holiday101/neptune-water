@@ -126,6 +126,63 @@ def geocode_addresses(pairs):
     return results
 
 
+def addressed_parcels_gdf(conn):
+    """GeoDataFrame of only the parcels that have an address. In this
+    county's parcel export, a parcel with no address is street / public
+    right-of-way, not a taxable lot — i.e. a road (see also the README).
+    Roads are never a valid match target for a meter: used everywhere a
+    meter gets matched to a parcel, by point-in-polygon or by nearest
+    distance, so a meter can never land on one (see match_points_to_parcels
+    below and its callers in this file and import_meter_locations.py)."""
+    rows = conn.execute("SELECT parcel_id, geometry FROM parcels WHERE address IS NOT NULL").fetchall()
+    return gpd.GeoDataFrame(
+        {"parcel_id": [r["parcel_id"] for r in rows]},
+        geometry=[shape(json.loads(r["geometry"])) for r in rows],
+        crs="EPSG:4326",
+    )
+
+
+def match_points_to_parcels(points_gdf, addressed_gdf):
+    """Matches each point in points_gdf (EPSG:4326) to the closest parcel
+    in addressed_gdf — which the caller must have already filtered to
+    non-road parcels (see addressed_parcels_gdf). Point-in-polygon first;
+    for anything that misses (either a point genuinely outside every
+    parcel, or — very commonly — a point that lands inside a road polygon,
+    which was excluded and so can never itself be the match), falls back to
+    whichever addressed parcel is nearest.
+
+    Returns a DataFrame aligned to points_gdf's index with columns
+    parcel_id, match_method ('within' | 'nearest' | None), match_dist_m
+    (0.0 for 'within', the real distance in meters for 'nearest')."""
+    out = pd.DataFrame(
+        {"parcel_id": pd.NA, "match_method": pd.NA, "match_dist_m": pd.NA},
+        index=points_gdf.index,
+    )
+    if addressed_gdf.empty:
+        return out
+
+    within = gpd.sjoin(points_gdf[["geometry"]], addressed_gdf, how="left", predicate="within")
+    within = within[~within.index.duplicated(keep="first")]
+    out["parcel_id"] = within["parcel_id"]
+    matched = out["parcel_id"].notna()
+    out.loc[matched, "match_method"] = "within"
+    out.loc[matched, "match_dist_m"] = 0.0
+
+    unmatched = out["parcel_id"].isna()
+    if unmatched.any():
+        pts_m = points_gdf.loc[unmatched, ["geometry"]].to_crs(AREA_CRS)
+        addressed_m = addressed_gdf.to_crs(AREA_CRS)
+        nearest = gpd.sjoin_nearest(
+            pts_m, addressed_m[["parcel_id", "geometry"]], distance_col="dist_m"
+        )
+        nearest = nearest[~nearest.index.duplicated(keep="first")]
+        out.loc[nearest.index, "parcel_id"] = nearest["parcel_id"].values
+        out.loc[nearest.index, "match_method"] = "nearest"
+        out.loc[nearest.index, "match_dist_m"] = nearest["dist_m"].values
+
+    return out
+
+
 def build_address_index(parcels_gdf):
     """Normalized-address -> set of parcel_ids, for the string-match fallback."""
     exact, prefix = {}, {}
@@ -163,12 +220,22 @@ def run(geojson_path, conn=None):
         ),
         crs="EPSG:4326",
     )
-    joined = gpd.sjoin(points_gdf, parcels_gdf[["parcel_id", "geometry"]], how="left", predicate="within")
+    # Matched against addressed (non-road) parcels only — a geocoded point
+    # landing inside a road/right-of-way polygon is nudged to the nearest
+    # real parcel instead of being "matched" to the road itself (see
+    # addressed_parcels_gdf / match_points_to_parcels).
+    match = match_points_to_parcels(points_gdf, addressed_parcels_gdf(conn))
     geocode_matches = {
-        row["meter_id"]: row["parcel_id"]
-        for _, row in joined.iterrows() if pd.notna(row["parcel_id"])
+        points_gdf.loc[idx, "meter_id"]: row["parcel_id"]
+        for idx, row in match.iterrows() if pd.notna(row["parcel_id"])
     }
-    print(f"  {len(geocode_matches)} / {len(geocoded)} geocoded points fell inside a parcel")
+    n_within = int((match["match_method"] == "within").sum())
+    n_nearest = int((match["match_method"] == "nearest").sum())
+    print(
+        f"  {len(geocode_matches)} / {len(geocoded)} geocoded points matched a non-road parcel "
+        f"({n_within} directly inside one, {n_nearest} nudged to the nearest one because the "
+        "point landed on a road)"
+    )
 
     print("Falling back to address matching for the rest...")
     # Scoped to DEFAULT_CITY, not the full parcels_gdf — this geojson covers
@@ -260,12 +327,131 @@ def backfill_areas(conn=None):
     return {"updated": len(updates)}
 
 
+def fix_road_matches(conn=None):
+    """One-off (or re-runnable) repair for meter_parcels / gis_meters rows
+    that got matched to a road (a parcel with no address) before run() /
+    import_meter_locations.py started excluding those — see
+    addressed_parcels_gdf and match_points_to_parcels. Re-resolves each
+    affected row to the nearest addressed parcel using its already-stored
+    lat/lon, so it needs neither the original parcels .geojson nor the
+    meter shapefile, nor a re-run of the rate-limited Census geocoder —
+    just what's already in the database.
+
+    Handles all three affected sources:
+      - gis_meters: every row has a surveyed lat/lon, so every road match
+        there is directly fixable.
+      - meter_parcels rows with match_method='geocoded': these carry their
+        own lat/lon from the geocoding step, so they're directly fixable too.
+      - meter_parcels rows with match_method='gis_survey': copied over from
+        gis_meters by import_meter_locations.match_customers_via_survey(),
+        including its lat/lon — so once gis_meters is fixed above,
+        re-running that same reconciliation cascades the fix into most of
+        these for free. A few can be left stale by that reconciliation's
+        own ambiguity rule (skips an address whose surveyed meters now span
+        more than one parcel) — those still have their own copied lat/lon
+        in meter_parcels, so a final direct pass mops them up too.
+    match_method='address_exact'/'address_prefix' rows are never affected:
+    that fallback only ever indexes parcels that have an address, i.e.
+    already excludes roads.
+    """
+    conn = conn or db.get_conn()
+    addressed_gdf = addressed_parcels_gdf(conn)
+    if addressed_gdf.empty:
+        print("No addressed parcels found — nothing to fix against.")
+        return {"gis_meters_fixed": 0, "meter_parcels_geocoded_fixed": 0}
+
+    def _refix(rows, table, extra_set_cols=()):
+        if not rows:
+            return 0
+        pts = gpd.GeoDataFrame(
+            {"meter_id": [r["meter_id"] for r in rows]},
+            geometry=gpd.points_from_xy([r["lon"] for r in rows], [r["lat"] for r in rows]),
+            crs="EPSG:4326",
+        )
+        match = match_points_to_parcels(pts, addressed_gdf)
+        updates = []
+        for idx, row in match.iterrows():
+            if pd.isna(row["parcel_id"]):
+                continue
+            update = {"meter_id": pts.loc[idx, "meter_id"], "parcel_id": row["parcel_id"]}
+            for col in extra_set_cols:
+                update[col] = row[col]
+            updates.append(update)
+        if updates:
+            set_clause = ", ".join(f"{c} = :{c}" for c in ("parcel_id", *extra_set_cols))
+            conn.executemany(f"UPDATE {table} SET {set_clause} WHERE meter_id = :meter_id", updates)
+        return len(updates)
+
+    road_gis = conn.execute("""
+        SELECT g.meter_id, g.lat, g.lon FROM gis_meters g
+        JOIN parcels p ON p.parcel_id = g.parcel_id
+        WHERE p.address IS NULL
+    """).fetchall()
+    gis_fixed = _refix(road_gis, "gis_meters", extra_set_cols=("match_method", "match_dist_m"))
+    print(f"  gis_meters: re-matched {gis_fixed} / {len(road_gis)} road-matched meters to a non-road parcel")
+
+    road_geocoded = conn.execute("""
+        SELECT mp.meter_id, mp.lat, mp.lon FROM meter_parcels mp
+        JOIN parcels p ON p.parcel_id = mp.parcel_id
+        WHERE p.address IS NULL AND mp.match_method = 'geocoded' AND mp.lat IS NOT NULL
+    """).fetchall()
+    geocoded_fixed = _refix(road_geocoded, "meter_parcels")
+    print(f"  meter_parcels (geocoded): re-matched {geocoded_fixed} / {len(road_geocoded)}")
+    conn.commit()
+
+    # gis_survey rows in meter_parcels are copied from gis_meters, so
+    # re-running that reconciliation now that gis_meters is fixed cascades
+    # the fix into them too, without needing to touch them directly.
+    import import_meter_locations as iml
+    print("  meter_parcels (gis_survey): re-reconciling against the fixed GIS survey...")
+    reconcile = iml.match_customers_via_survey(conn)
+    conn.commit()
+    print(f"    {reconcile['changed']} rows changed")
+
+    # Mop-up: a handful of gis_survey rows can be left stale by that
+    # reconciliation's own ambiguity rule (it skips an address whose
+    # surveyed meters now span more than one parcel) — those still have
+    # their own copied lat/lon in meter_parcels, so fix them directly too.
+    road_leftover = conn.execute("""
+        SELECT mp.meter_id, mp.lat, mp.lon FROM meter_parcels mp
+        JOIN parcels p ON p.parcel_id = mp.parcel_id
+        WHERE p.address IS NULL AND mp.lat IS NOT NULL
+    """).fetchall()
+    leftover_fixed = _refix(road_leftover, "meter_parcels")
+    if road_leftover:
+        print(f"  meter_parcels (leftover): re-matched {leftover_fixed} / {len(road_leftover)}")
+        conn.commit()
+
+    remaining = conn.execute("""
+        SELECT COUNT(*) n FROM meter_parcels mp JOIN parcels p ON p.parcel_id = mp.parcel_id
+        WHERE p.address IS NULL
+    """).fetchone()["n"]
+    remaining += conn.execute("""
+        SELECT COUNT(*) n FROM gis_meters g JOIN parcels p ON p.parcel_id = g.parcel_id
+        WHERE p.address IS NULL
+    """).fetchone()["n"]
+    if remaining:
+        print(f"  WARNING: {remaining} road match(es) remain — likely rows with no stored "
+              "lat/lon (address_exact/address_prefix shouldn't produce these; investigate if seen).")
+    else:
+        print("  0 road matches remaining.")
+
+    return {
+        "gis_meters_fixed": gis_fixed, "meter_parcels_geocoded_fixed": geocoded_fixed,
+        "meter_parcels_leftover_fixed": leftover_fixed, "remaining_road_matches": remaining,
+        **reconcile,
+    }
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--backfill-areas":
         backfill_areas()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--fix-roads":
+        fix_road_matches()
     elif len(sys.argv) == 2:
         run(sys.argv[1])
     else:
         print("Usage: python3 import_gis.py <path to parcels .geojson>")
         print("       python3 import_gis.py --backfill-areas   (fixup for a pre-existing db)")
+        print("       python3 import_gis.py --fix-roads        (re-match meters currently on a road)")
         sys.exit(1)
