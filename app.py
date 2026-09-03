@@ -223,6 +223,18 @@ def _cached_gis_meters(_conn):
 # instead of their real content. See README "Public deployment" section.
 PUBLIC_MODE = os.getenv("NEPTUNE_PUBLIC_MODE", "false").strip().lower() == "true"
 
+# Sync & Backfill calls Neptune's real API, which enforces its OWN daily
+# quota server-side — but this app's budget tracking (api_call_log,
+# NEPTUNE_DAILY_CALL_BUDGET) only counts calls made from *this* SQLite db.
+# Running a sync from a laptop against the same Neptune site the production
+# server is backfilling from spends real quota that the server's own count
+# has no way to see, silently throwing off its budget math and resumable
+# backfill. So sync is opt-in per machine, off by default (i.e. off on any
+# local checkout that hasn't explicitly turned it on) — set
+# NEPTUNE_ALLOW_SYNC=true only in the one place that should actually be
+# hitting the API (see README "Public deployment").
+ALLOW_SYNC = os.getenv("NEPTUNE_ALLOW_SYNC", "false").strip().lower() == "true"
+
 ROLE_RANK = {"viewer": 0, "admin": 1, "global": 2}
 
 # Per-session lockout after too many wrong passwords. This is a *session*
@@ -1027,7 +1039,14 @@ def _render_ai_tab():
 
 
 with tab_sync:
-    if IS_GLOBAL:
+    if not ALLOW_SYNC:
+        st.info(
+            "🔒 Sync & Backfill is disabled on this machine. It only runs on the production "
+            "server, so a local checkout can't silently spend Neptune API quota the server's "
+            "own budget tracking doesn't know about. Set `NEPTUNE_ALLOW_SYNC=true` in `.env` "
+            "if you really need to run it here (see README)."
+        )
+    elif IS_GLOBAL:
         _render_sync_tab()
     else:
         _locked_message("Sync & Backfill", "global")

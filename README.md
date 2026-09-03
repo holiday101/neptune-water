@@ -85,6 +85,15 @@ headroom). The daily counter resets at UTC midnight — adjust in `neptune_db.py
 (`calls_today`) if Neptune's actual reset is on a different clock; this wasn't
 stated in the API docs.
 
+**This tracking is per-database, not per-Neptune-site** — Neptune's real 500/day
+cap is shared across every machine hitting the same site's credentials, but
+`api_call_log` only sees calls made against *this* `neptune.db`. Two checkouts
+syncing against the same site (e.g. your laptop and the production server) can
+each think they have budget left while actually racing each other against
+Neptune's real quota. That's why Sync & Backfill is gated behind
+`NEPTUNE_ALLOW_SYNC` (default `false` — see "Public deployment" below): leave it
+off on every checkout except whichever one is actually meant to sync.
+
 ## Files
 
 - `neptune_client.py` — auth + raw API calls, budget-enforced, retries on transient 5xx/timeout
@@ -198,6 +207,13 @@ All tabs are always visible to everyone logged in; a tab above your role shows
 a locked message instead of its real content — logging out and back in with a
 higher-role account is the only way to unlock it (there's no in-place upgrade
 prompt, since access is per-person now, not a shared secret).
+
+**Sync & Backfill needs a second flag, independent of role**: even a `global`
+account sees a "disabled on this machine" message there unless
+`NEPTUNE_ALLOW_SYNC=true` is also set (default `false` — see "Rate limits"
+above for why). Only set it `true` in the one deployment that should actually
+be hitting the Neptune API — normally the production server, not a local
+checkout, and not more than one place at a time.
 
 **Bootstrapping your first login**: set `NEPTUNE_SEED_GLOBAL_EMAIL` and
 `NEPTUNE_SEED_GLOBAL_PASSWORD` in `.env`. On startup, if no global account
