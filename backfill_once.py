@@ -21,7 +21,16 @@ Usage:  python3 backfill_once.py
 Exit code 0 whether it made progress, hit today's budget cap, or was
 already complete — non-zero only on a real error (bad .env, API failure),
 so a cron/systemd log stays quiet on the expected path.
+
+Also writes STATUS_FILE_PATH (JSON: complete, percent_complete, checked_at —
+nothing sensitive) after every run, so something outside this machine can
+poll progress over plain HTTPS with no credentials at all — see
+`location = /water-status.json` in the server's nginx config. This is what
+lets a scheduled check (which can't SSH in with a key that only exists on
+someone's laptop) know when to notify that the backfill is done.
 """
+import json
+import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -36,11 +45,34 @@ load_dotenv()
 BACKFILL_DAYS = 730  # ~2 years, matching the Sync tab's default range
 DONE_MARKER_KEY = "water_usage_backfill_once_done"
 RANGE_KEY = "water_usage_backfill_once_range"
+STATUS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "backfill_status.json")
+
+
+def _write_status_file(conn):
+    done = db.get_sync_state(conn, DONE_MARKER_KEY)
+    progress = sync.backfill_progress(conn)
+    status = {
+        "complete": done is not None,
+        "percent_complete": 100.0 if done else (progress["percent_complete"] if progress else 0.0),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp_path = STATUS_FILE_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(status, f)
+    os.replace(tmp_path, STATUS_FILE_PATH)  # atomic — never leaves a half-written file for a poller to read
 
 
 def main():
     conn = db.get_conn()
+    try:
+        _run(conn)
+    finally:
+        # Always refresh the status file, even on failure — a poller should
+        # see a fresh checked_at either way, not a stale one from days ago.
+        _write_status_file(conn)
 
+
+def _run(conn):
     done = db.get_sync_state(conn, DONE_MARKER_KEY)
     if done:
         print(f"Backfill already completed at {done['completed_at']} — nothing to do.")
