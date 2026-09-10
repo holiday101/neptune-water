@@ -7,3 +7,4 @@ venv/
 .DS_Store
 .claude/
 backups/
+my-ec2-key.pem

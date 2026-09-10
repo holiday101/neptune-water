@@ -52,21 +52,27 @@ def _leak_color(min_consumption, threshold):
 # water_usage has grown into the tens of millions of rows. Streamlit reruns
 # the WHOLE script — every `with tab_x:` block, not just the visible tab — on
 # every single interaction anywhere in the app (typing in a filter box,
-# logging in, clicking any button). Without caching, that meant a plain
-# COUNT(*) and a DISTINCT miu_id scan (neither cheap at this size on a small
-# EC2 box) ran on every click regardless of what was clicked, adding 30-60+
-# seconds of dead weight each time. `_conn` (underscore prefix) tells
+# logging in, clicking any button). `_conn` (underscore prefix) tells
 # st.cache_data to skip trying to hash the connection object itself.
 #
-# No ttl: these only need to be right immediately after a sync, and every
-# sync path already calls st.cache_data.clear() on success (see
-# _render_sync_tab) — that's the actual freshness mechanism. A time-based
-# expiry would only add back the slow path on a schedule for no benefit
-# (and a short one actively did: a restart during deploys already empties
-# this in-memory cache, so a 10-minute TTL on top of that meant anyone
-# who'd been away for a coffee break paid the 60+s cost all over again).
-# Restarting the service (or running import_billing.py / any direct DB
-# edit outside the app) also clears it, since it's process memory.
+# The genuinely expensive aggregations over the full water_usage table
+# (leak/continuous-usage status, the row-count shown in the sidebar) are no
+# longer computed here at all -- they're precomputed by
+# neptune_db.recompute_leak_status(), run as part of each sync (see
+# neptune_sync.py), and these functions just read the small results back.
+# That's what makes it safe for every sync path to still call
+# st.cache_data.clear() on success (see _render_sync_tab): every remaining
+# cached function below is bounded by meter/parcel count, not by how big
+# water_usage has grown, so a cold cache is cheap regardless.
+#
+# No ttl: these only need to be right immediately after a sync, and that's
+# exactly when the cache gets cleared. A time-based expiry would only add
+# back a slow-ish path on a schedule for no benefit (and used to actively
+# hurt: a restart during deploys already empties this in-memory cache, so a
+# TTL on top of that meant anyone who'd been away for a while paid the cost
+# all over again). Restarting the service (or running import_billing.py /
+# any direct DB edit outside the app) also clears it, since it's process
+# memory.
 @st.cache_data
 def _cached_counts(_conn):
     return db.counts(_conn)
@@ -88,51 +94,49 @@ def _cached_customers_df(_conn):
 
 @st.cache_data
 def _cached_usage_meters(_conn):
+    # EXISTS instead of `miu_id IN (SELECT DISTINCT miu_id FROM water_usage)`:
+    # the IN-subquery form did a full DISTINCT scan of water_usage (tens of
+    # millions of rows); EXISTS lets SQLite do one indexed lookup per
+    # customer row instead (~2,700 of them) -- measured ~30x faster on the
+    # real data, same result.
     return pd.read_sql_query(
         "SELECT DISTINCT c.miu_id, c.account_number, c.meter_number, b.customer_name "
         "FROM customers c LEFT JOIN customer_billing b ON b.meter_id = c.miu_id "
-        "WHERE c.miu_id IN (SELECT DISTINCT miu_id FROM water_usage) "
+        "WHERE EXISTS (SELECT 1 FROM water_usage w WHERE w.miu_id = c.miu_id) "
         "ORDER BY b.customer_name, c.account_number",
         _conn,
     )
 
 
 @st.cache_data
-def _cached_continuous_users(_conn, window_start_str, max_date):
-    # window_start_str/max_date are derived from a fresh MAX(reading_date)
-    # lookup each run (cheap — that one's index-backed and near-instant), so
-    # this cache key changes and naturally refreshes itself as soon as new
-    # usage data lands, with no explicit invalidation needed for this one.
-    #
-    # Uses the lowest hourly reading in the window as "the continuous
-    # amount" — every single hour this meter ran was at least this much, so
-    # it's a guaranteed floor on how bad the leak is. Previously used the
-    # mode (most frequently recurring rounded rate) instead, on the theory
-    # that it better represented the rate a meter "keeps coming back to" —
-    # in practice that produced bad results (see git history), so this went
-    # back to the simpler min.
-    raw = pd.read_sql_query(
-        "SELECT miu_id, consumption_with_multiplier AS gal "
-        "FROM water_usage WHERE reading_date > ? AND reading_date <= ?",
-        _conn, params=(window_start_str, max_date),
-    )
-    if raw.empty:
-        return pd.DataFrame(columns=[
-            "miu_id", "meter_number", "account_number", "customer_name",
-            "reading_count", "zero_count", "min_consumption",
-            "total_consumption",
-        ])
+def _cached_leak_status(_conn):
+    """Trailing-7-day leak/continuous-usage status per meter, precomputed by
+    neptune_db.recompute_leak_status() as part of each sync (see
+    neptune_sync.py) rather than live here. water_usage grew into the tens
+    of millions of rows and this used to be two full scans of it
+    (_cached_continuous_users + _cached_streak_starts, see git history) —
+    expensive enough to make every cache-cold page load (i.e. right after
+    any sync, since sync clears the whole Streamlit cache) take 30-60+
+    seconds. Moving the aggregation into the sync job itself means the app
+    only ever does a cheap read of a ~meter-count-sized table.
 
-    grouped = raw.groupby("miu_id").agg(
-        reading_count=("gal", "count"),
-        zero_count=("gal", lambda s: int((s.isna() | (s <= 0)).sum())),
-        min_consumption=("gal", "min"),
-        total_consumption=("gal", "sum"),
-    ).reset_index()
+    Returns the same qualifying ("zero-free week", >7 readings), meta-joined
+    shape the old two functions used to produce together -- including
+    window_start/window_end (as of the last sync) and streak_start /
+    since_data_began, so callers don't need a separate merge.
+    """
+    cols = [
+        "miu_id", "window_start", "window_end", "meter_number", "account_number",
+        "customer_name", "reading_count", "zero_count", "min_consumption",
+        "total_consumption", "streak_start", "since_data_began",
+    ]
+    status = pd.read_sql_query("SELECT * FROM meter_leak_status", _conn)
+    if status.empty:
+        return pd.DataFrame(columns=cols)
 
-    qualifying = grouped[(grouped["zero_count"] == 0) & (grouped["reading_count"] > 7)]
+    qualifying = status[(status["zero_count"] == 0) & (status["reading_count"] > 7)]
     if qualifying.empty:
-        return qualifying.assign(meter_number=[], account_number=[], customer_name=[])
+        return qualifying.reindex(columns=cols)
 
     meta = pd.read_sql_query(
         "SELECT c.miu_id, c.meter_number, c.account_number, b.customer_name "
@@ -143,35 +147,6 @@ def _cached_continuous_users(_conn, window_start_str, max_date):
         qualifying.merge(meta, on="miu_id", how="left")
         .sort_values("min_consumption", ascending=False)
         .reset_index(drop=True)
-    )
-
-
-@st.cache_data
-def _cached_streak_starts(_conn):
-    """For every meter, when its *current* continuous (never-zero) streak
-    began — the reading right after the most recent zero/negative/missing
-    reading. A gap (missing hour) doesn't end a streak here, matching how
-    "continuous" is defined in _cached_continuous_users above — only an
-    actual zero reading does. since_data_began=1 means this meter has never
-    once read zero in all our history, so the streak might genuinely have
-    started earlier than we can see — the caller should hedge that case
-    ("since at least ...") rather than state it as a hard fact."""
-    return pd.read_sql_query(
-        """
-        WITH last_break AS (
-            SELECT miu_id, MAX(reading_date) AS break_date
-            FROM water_usage
-            WHERE consumption_with_multiplier IS NULL OR consumption_with_multiplier <= 0
-            GROUP BY miu_id
-        )
-        SELECT w.miu_id, MIN(w.reading_date) AS streak_start,
-               CASE WHEN lb.break_date IS NULL THEN 1 ELSE 0 END AS since_data_began
-        FROM water_usage w
-        LEFT JOIN last_break lb ON lb.miu_id = w.miu_id
-        WHERE w.reading_date > COALESCE(lb.break_date, '0000-01-01')
-        GROUP BY w.miu_id
-        """,
-        _conn,
     )
 
 
@@ -552,28 +527,32 @@ with tab_continuous:
         "at least this much, so it's a guaranteed floor on how bad the leak is."
     )
 
-    bounds = conn.execute(
-        "SELECT MAX(reading_date) AS max_date FROM water_usage"
-    ).fetchone()
-    max_date = bounds["max_date"] if bounds else None
-
-    if not max_date:
+    has_usage = conn.execute("SELECT 1 FROM water_usage LIMIT 1").fetchone() is not None
+    if not has_usage:
         st.info("No water usage data yet. Go to **Sync & Backfill** to pull some.")
     else:
-        window_end = pd.Timestamp(max_date)
-        window_start = window_end - pd.Timedelta(days=7)
-        window_start_str = window_start.isoformat()
-
-        continuous = _cached_continuous_users(conn, window_start_str, max_date)
-        continuous = continuous.merge(_cached_streak_starts(conn), on="miu_id", how="left")
-        continuous["continuous_since"] = continuous.apply(
-            lambda r: (
-                ("≥ " if r["since_data_began"] == 1 else "") + _fmt_dt(r["streak_start"], with_time=False)
-            ) if pd.notna(r["streak_start"]) else "",
-            axis=1,
+        leak_window = pd.read_sql_query(
+            "SELECT window_start, window_end FROM meter_leak_status LIMIT 1", conn
         )
+        if leak_window.empty:
+            st.info(
+                "Leak status hasn't been computed for this data yet — it's refreshed "
+                "automatically after each sync. Check **Sync & Backfill**, or run one now."
+            )
+            continuous = pd.DataFrame()
+        else:
+            window_start_str = leak_window["window_start"].iloc[0]
+            max_date = leak_window["window_end"].iloc[0]
 
-        st.caption(f"Window: {_fmt_dt(window_start_str)} → {_fmt_dt(max_date)}.")
+            continuous = _cached_leak_status(conn)
+            continuous["continuous_since"] = continuous.apply(
+                lambda r: (
+                    ("≥ " if r["since_data_began"] == 1 else "") + _fmt_dt(r["streak_start"], with_time=False)
+                ) if pd.notna(r["streak_start"]) else "",
+                axis=1,
+            )
+
+            st.caption(f"Window: {_fmt_dt(window_start_str)} → {_fmt_dt(max_date)}.")
 
         if continuous.empty:
             st.info(
@@ -710,16 +689,14 @@ with tab_map:
         )
         map_threshold = 5 if show_smaller_map else 10
 
-        map_bounds = conn.execute("SELECT MAX(reading_date) AS m FROM water_usage").fetchone()
-        map_max_date = map_bounds["m"] if map_bounds else None
-
-        if not map_max_date:
+        # Reads the same precomputed table the Continuous Users tab uses (see
+        # _cached_leak_status) instead of re-running the windowed query here.
+        map_continuous = _cached_leak_status(conn)
+        if map_continuous.empty:
             if not meter_parcels.empty:
-                st.info("No water usage data yet — showing parcels with no leak status.")
+                st.info("No current leak status yet — showing parcels with no leak status.")
             leak_by_meter = pd.Series(dtype=float)
         else:
-            map_window_start = (pd.Timestamp(map_max_date) - pd.Timedelta(days=7)).isoformat()
-            map_continuous = _cached_continuous_users(conn, map_window_start, map_max_date)
             leak_by_meter = map_continuous.set_index("miu_id")["min_consumption"]
 
         # PolygonLayer with flat per-ring records, not GeoJsonLayer — the

@@ -71,7 +71,14 @@ def sync_water_usage_recent(client, days=3, actual_consumption=False):
     e.g. 3000 meters / 100 per page = 30 calls for a single ~8-day window."""
     end = date.today()
     begin = end - timedelta(days=days)
-    return _pull_window(client, begin, end, actual_consumption)
+    rows = _pull_window(client, begin, end, actual_consumption)
+    if rows:
+        # Refreshes meter_leak_status / the cached row count (see
+        # neptune_db.recompute_leak_status) so the app's leak/continuous-usage
+        # views reflect this sync without recomputing live on the next page
+        # load -- the whole reason this sync clears the app's Streamlit cache.
+        db.recompute_leak_status(client.conn)
+    return rows
 
 
 def _pull_window(client, begin, end, actual_consumption):
@@ -134,6 +141,9 @@ def start_or_resume_backfill(client, overall_start, overall_end, actual_consumpt
         db.set_sync_state(client.conn, BACKFILL_STATE_KEY, state)
     else:
         db.clear_sync_state(client.conn, BACKFILL_STATE_KEY)
+
+    if rows_written:
+        db.recompute_leak_status(client.conn)
 
     return {
         "windows_completed_this_run": windows_done,
@@ -238,6 +248,9 @@ def rank_and_deep_dive(client, call_budget, history_days=730, recent_scan_days=6
             stopped_reason = "budget_exceeded_mid_batch"
             break
         meters_completed += len(batch)
+
+    if rows_written:
+        db.recompute_leak_status(client.conn)
 
     return {
         "meters_scanned_phase1": len(totals),

@@ -24,7 +24,7 @@ import json
 import os
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "neptune.db")
 
@@ -165,6 +165,31 @@ CREATE TABLE IF NOT EXISTS gis_meters (
     imported_at   TEXT
 );
 
+-- Precomputed leak/continuous-usage status, one row per meter that has
+-- had any water_usage reading in the trailing 7-day window as of the last
+-- recompute. Populated by recompute_leak_status() after each sync (see
+-- neptune_sync.py) instead of being computed live on every Streamlit page
+-- load -- the underlying aggregation (two full scans of water_usage) got
+-- too slow to run on every cache-cold page view once water_usage grew into
+-- the tens of millions of rows. window_start/window_end/streak_start/
+-- since_data_began mirror exactly what app.py used to compute inline via
+-- _cached_continuous_users / _cached_streak_starts, including that
+-- zero_count counts a NULL reading as a zero even though reading_count does
+-- not -- that's how the existing "continuous" definition already worked,
+-- kept as-is here rather than silently changed.
+CREATE TABLE IF NOT EXISTS meter_leak_status (
+    miu_id             TEXT PRIMARY KEY,
+    window_start       TEXT NOT NULL,
+    window_end         TEXT NOT NULL,
+    reading_count      INTEGER NOT NULL,
+    zero_count         INTEGER NOT NULL,
+    min_consumption    REAL,
+    total_consumption  REAL,
+    streak_start       TEXT,
+    since_data_began   INTEGER NOT NULL DEFAULT 0,
+    computed_at        TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_water_usage_miu ON water_usage(miu_id);
 CREATE INDEX IF NOT EXISTS idx_water_usage_date ON water_usage(reading_date);
 CREATE INDEX IF NOT EXISTS idx_customers_account ON customers(account_number);
@@ -172,6 +197,19 @@ CREATE INDEX IF NOT EXISTS idx_billing_account ON customer_billing(account_numbe
 CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users(email);
 CREATE INDEX IF NOT EXISTS idx_meter_parcels_parcel ON meter_parcels(parcel_id);
 CREATE INDEX IF NOT EXISTS idx_gis_meters_parcel ON gis_meters(parcel_id);
+
+-- Partial index over just the zero/negative/missing readings -- lets
+-- recompute_leak_status() find each meter's most recent "break" (last zero
+-- reading) as an index-only scan of that subset instead of the full table.
+CREATE INDEX IF NOT EXISTS idx_water_usage_zero
+    ON water_usage(miu_id, reading_date)
+    WHERE consumption_with_multiplier IS NULL OR consumption_with_multiplier <= 0;
+
+-- Composite, covering index for per-meter date-ordered aggregates (streak
+-- start, min/count/sum over a window) -- lets those run as an index scan
+-- instead of a full table scan as water_usage keeps growing.
+CREATE INDEX IF NOT EXISTS idx_water_usage_miu_date
+    ON water_usage(miu_id, reading_date, consumption_with_multiplier);
 """
 
 PBKDF2_ITERATIONS = 200_000
@@ -353,9 +391,118 @@ def upsert_usage_scan(conn, rows):
     conn.commit()
 
 
+LEAK_STATUS_WINDOW_DAYS = 7
+WATER_USAGE_COUNT_STATE_KEY = "water_usage_row_count"
+
+
+def recompute_leak_status(conn):
+    """Recomputes the trailing-7-day leak/continuous-usage stats for every
+    meter with usage data in that window, plus each such meter's current
+    zero-free streak start, and replaces meter_leak_status wholesale. Call
+    this after any sync that writes to water_usage (see neptune_sync.py) --
+    it moves the expensive aggregation out of the Streamlit request path.
+    Also refreshes the cached water_usage row count counts() reads (see
+    above), as a side effect of the same pass over the table.
+
+    Returns the number of meters written, or 0 if there's no usage data yet.
+    """
+    row = conn.execute("SELECT MAX(reading_date) AS m FROM water_usage").fetchone()
+    max_date = row["m"] if row else None
+    if not max_date:
+        return 0
+
+    window_end = datetime.fromisoformat(max_date)
+    window_start = (window_end - timedelta(days=LEAK_STATUS_WINDOW_DAYS)).isoformat()
+
+    weekly = {
+        r["miu_id"]: r
+        for r in conn.execute(
+            """
+            SELECT miu_id,
+                   COUNT(consumption_with_multiplier) AS reading_count,
+                   SUM(CASE WHEN consumption_with_multiplier IS NULL
+                             OR consumption_with_multiplier <= 0
+                        THEN 1 ELSE 0 END) AS zero_count,
+                   MIN(consumption_with_multiplier) AS min_consumption,
+                   SUM(consumption_with_multiplier) AS total_consumption
+            FROM water_usage
+            WHERE reading_date > ? AND reading_date <= ?
+            GROUP BY miu_id
+            """,
+            (window_start, max_date),
+        )
+    }
+
+    streaks = {
+        r["miu_id"]: r
+        for r in conn.execute(
+            """
+            WITH last_break AS (
+                SELECT miu_id, MAX(reading_date) AS break_date
+                FROM water_usage
+                WHERE consumption_with_multiplier IS NULL OR consumption_with_multiplier <= 0
+                GROUP BY miu_id
+            )
+            SELECT w.miu_id, MIN(w.reading_date) AS streak_start,
+                   CASE WHEN lb.break_date IS NULL THEN 1 ELSE 0 END AS since_data_began
+            FROM water_usage w
+            LEFT JOIN last_break lb ON lb.miu_id = w.miu_id
+            WHERE w.reading_date > COALESCE(lb.break_date, '0000-01-01')
+            GROUP BY w.miu_id
+            """
+        )
+    }
+
+    now = _now()
+    leak_rows = []
+    for miu_id, w in weekly.items():
+        s = streaks.get(miu_id)
+        leak_rows.append({
+            "miu_id": miu_id,
+            "window_start": window_start,
+            "window_end": max_date,
+            "reading_count": w["reading_count"],
+            "zero_count": w["zero_count"],
+            "min_consumption": w["min_consumption"],
+            "total_consumption": w["total_consumption"],
+            "streak_start": s["streak_start"] if s else None,
+            "since_data_began": s["since_data_began"] if s else 0,
+            "computed_at": now,
+        })
+
+    conn.execute("DELETE FROM meter_leak_status")
+    conn.executemany(
+        """
+        INSERT INTO meter_leak_status
+            (miu_id, window_start, window_end, reading_count, zero_count,
+             min_consumption, total_consumption, streak_start, since_data_began, computed_at)
+        VALUES (:miu_id, :window_start, :window_end, :reading_count, :zero_count,
+                :min_consumption, :total_consumption, :streak_start, :since_data_began,
+                :computed_at)
+        """,
+        leak_rows,
+    )
+
+    total_rows = conn.execute("SELECT COUNT(*) AS n FROM water_usage").fetchone()["n"]
+    set_sync_state(conn, WATER_USAGE_COUNT_STATE_KEY, {"rows": total_rows, "computed_at": now})
+
+    conn.commit()
+    return len(leak_rows)
+
+
 def counts(conn):
     c = conn.execute("SELECT COUNT(*) AS n FROM customers").fetchone()["n"]
-    w = conn.execute("SELECT COUNT(*) AS n FROM water_usage").fetchone()["n"]
+    # water_usage is tens of millions of rows -- COUNT(*) there is a full
+    # index scan (measured several seconds even on fast local disk, worse on
+    # a small server under load). It's a display number, not used for any
+    # decision, so we maintain it as a side effect of recompute_leak_status()
+    # (see below) rather than recomputing it live on every page load. Falls
+    # back to a live count if that hasn't run yet (e.g. brand new database).
+    cached = get_sync_state(conn, WATER_USAGE_COUNT_STATE_KEY)
+    if cached is not None:
+        w = cached["rows"]
+    else:
+        w = conn.execute("SELECT COUNT(*) AS n FROM water_usage").fetchone()["n"]
     return {"customers": c, "water_usage_rows": w}
 
 
