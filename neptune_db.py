@@ -165,6 +165,30 @@ CREATE TABLE IF NOT EXISTS gis_meters (
     imported_at   TEXT
 );
 
+-- Reference table for the 7 lot-size zones used in the conservation-pricing
+-- backlog idea (see the project's backlog doc): buckets properties by parcel
+-- square footage so a reasonable-irrigation baseline can be set per zone.
+-- Seeded with defaults by ensure_seed_lot_size_zones() below on first run,
+-- via INSERT OR IGNORE -- editable afterward (by a global user, or directly)
+-- without a code change, since nothing here re-seeds over an existing row.
+CREATE TABLE IF NOT EXISTS lot_size_zones (
+    zone      INTEGER PRIMARY KEY,
+    min_sqft  REAL NOT NULL,
+    max_sqft  REAL,              -- NULL = no upper bound (top zone)
+    label     TEXT NOT NULL
+);
+
+-- Same idea as lot_size_zones, but for BUILDING (structure) square footage
+-- rather than lot/parcel size -- reads parcels.building_sqft, which nothing
+-- currently populates (see the building_sqft column comment above / backlog
+-- doc). Seeded by ensure_seed_building_size_zones() below.
+CREATE TABLE IF NOT EXISTS building_size_zones (
+    zone      INTEGER PRIMARY KEY,
+    min_sqft  REAL NOT NULL,
+    max_sqft  REAL,              -- NULL = no upper bound (top zone)
+    label     TEXT NOT NULL
+);
+
 -- Precomputed leak/continuous-usage status, one row per meter that has
 -- had any water_usage reading in the trailing 7-day window as of the last
 -- recompute. Populated by recompute_leak_status() after each sync (see
@@ -224,6 +248,13 @@ _COLUMN_MIGRATIONS = {
     "parcels": [
         ("area_sqft", "REAL"),
         ("area_acres", "REAL"),
+        # Building footprint square footage -- NOT populated by import_gis.py
+        # (that only computes lot/parcel-boundary area) or by any other
+        # current import script. Nothing writes this column yet; it's added
+        # now so the building_size_zones join below has somewhere to read
+        # from once a building-footprint/improvements data source (e.g. a
+        # county assessor CAMA export) gets imported. See backlog doc.
+        ("building_sqft", "REAL"),
     ],
 }
 
@@ -258,6 +289,8 @@ def get_conn(readonly=False):
             os.environ.get("NEPTUNE_SEED_GLOBAL_EMAIL", ""),
             os.environ.get("NEPTUNE_SEED_GLOBAL_PASSWORD", ""),
         )
+        ensure_seed_lot_size_zones(conn)
+        ensure_seed_building_size_zones(conn)
     # If another connection (e.g. a second browser tab's session) is mid-write,
     # wait up to 5s for it to finish instead of failing immediately.
     conn.execute("PRAGMA busy_timeout=5000")
@@ -585,6 +618,56 @@ def ensure_seed_global_user(conn, email, password):
     if count_users_with_role(conn, "global") > 0:
         return
     create_user(conn, email, password, "global", created_by="seed")
+
+
+# Default 7-zone lot-size breakdown (square feet): 0-6k, 6-8k, 8-10k, 10-12k,
+# 12-24k, 24-48k, 48k+. See lot_size_zones in SCHEMA above.
+_DEFAULT_LOT_SIZE_ZONES = [
+    (1, 0, 6000, "0 - 6,000 sq ft"),
+    (2, 6000, 8000, "6,000 - 8,000 sq ft"),
+    (3, 8000, 10000, "8,000 - 10,000 sq ft"),
+    (4, 10000, 12000, "10,000 - 12,000 sq ft"),
+    (5, 12000, 24000, "12,000 - 24,000 sq ft"),
+    (6, 24000, 48000, "24,000 - 48,000 sq ft"),
+    (7, 48000, None, "48,000+ sq ft"),
+]
+
+
+def ensure_seed_lot_size_zones(conn):
+    """Inserts the default 7 lot-size zones if the table is empty-of-that-row
+    -- INSERT OR IGNORE per zone number, so it never overwrites a zone
+    someone has since edited (e.g. to move a boundary), only fills in ones
+    that are missing."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO lot_size_zones (zone, min_sqft, max_sqft, label) "
+        "VALUES (?, ?, ?, ?)",
+        _DEFAULT_LOT_SIZE_ZONES,
+    )
+    conn.commit()
+
+
+# Default 8-zone building-size breakdown (square feet): every 1,000 up to
+# 6,000, then 6-10k, then 10k+. See building_size_zones in SCHEMA above.
+_DEFAULT_BUILDING_SIZE_ZONES = [
+    (1, 0, 1000, "0 - 1,000 sq ft"),
+    (2, 1000, 2000, "1,000 - 2,000 sq ft"),
+    (3, 2000, 3000, "2,000 - 3,000 sq ft"),
+    (4, 3000, 4000, "3,000 - 4,000 sq ft"),
+    (5, 4000, 5000, "4,000 - 5,000 sq ft"),
+    (6, 5000, 6000, "5,000 - 6,000 sq ft"),
+    (7, 6000, 10000, "6,000 - 10,000 sq ft"),
+    (8, 10000, None, "10,000+ sq ft"),
+]
+
+
+def ensure_seed_building_size_zones(conn):
+    """Same idea as ensure_seed_lot_size_zones, for building_size_zones."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO building_size_zones (zone, min_sqft, max_sqft, label) "
+        "VALUES (?, ?, ?, ?)",
+        _DEFAULT_BUILDING_SIZE_ZONES,
+    )
+    conn.commit()
 
 
 # ---- GIS: parcels + account-to-parcel matches (see import_gis.py) --------

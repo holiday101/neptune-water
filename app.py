@@ -80,12 +80,33 @@ def _cached_counts(_conn):
 
 @st.cache_data
 def _cached_customers_df(_conn):
+    # Lot size comes from the parcel matched to this meter (see
+    # meter_parcels / import_gis.py) -- not every meter has a matched parcel,
+    # so area_sqft/lot_zone are NULL for those (LEFT JOINs throughout).
+    # Zones are computed by range joins against lot_size_zones /
+    # building_size_zones (see SCHEMA / ensure_seed_*_zones in neptune_db.py)
+    # rather than stored, so editing a zone boundary there takes effect
+    # immediately. building_sqft has no import source yet (nothing populates
+    # parcels.building_sqft currently -- see that column's comment in
+    # neptune_db.py and the backlog doc), so bldg_zone is NULL for everyone
+    # until that data gets imported; the join is here and ready for it.
     return pd.read_sql_query(
         """
         SELECT c.account_number, b.customer_name, b.location, b.primary_phone,
                b.secondary_phone, b.email_address, c.meter_number, c.miu_id,
-               c.cycle_route, c.meter_type, c.meter_size, b.parcel_id
-        FROM customers c LEFT JOIN customer_billing b ON b.meter_id = c.miu_id
+               c.cycle_route, c.meter_type, c.meter_size, b.parcel_id,
+               ROUND(p.area_sqft) AS lot_size_sqft, lz.zone AS lot_zone, lz.label AS lot_zone_label,
+               ROUND(p.building_sqft) AS building_sqft, bz.zone AS bldg_zone, bz.label AS bldg_zone_label
+        FROM customers c
+        LEFT JOIN customer_billing b ON b.meter_id = c.miu_id
+        LEFT JOIN meter_parcels mp ON mp.meter_id = c.miu_id
+        LEFT JOIN parcels p ON p.parcel_id = mp.parcel_id
+        LEFT JOIN lot_size_zones lz
+            ON p.area_sqft >= lz.min_sqft
+           AND (lz.max_sqft IS NULL OR p.area_sqft < lz.max_sqft)
+        LEFT JOIN building_size_zones bz
+            ON p.building_sqft >= bz.min_sqft
+           AND (bz.max_sqft IS NULL OR p.building_sqft < bz.max_sqft)
         ORDER BY c.account_number
         """,
         _conn,
@@ -127,7 +148,8 @@ def _cached_leak_status(_conn):
     """
     cols = [
         "miu_id", "window_start", "window_end", "meter_number", "account_number",
-        "customer_name", "reading_count", "zero_count", "min_consumption",
+        "customer_name", "address", "primary_phone", "secondary_phone", "email_address",
+        "reading_count", "zero_count", "min_consumption",
         "total_consumption", "streak_start", "since_data_began",
     ]
     status = pd.read_sql_query("SELECT * FROM meter_leak_status", _conn)
@@ -138,8 +160,12 @@ def _cached_leak_status(_conn):
     if qualifying.empty:
         return qualifying.reindex(columns=cols)
 
+    # location/phones/email come from customer_billing (see README -- Neptune
+    # itself exposes no contact info) so these are NULL for any meter with no
+    # billing-import match, same as customer_name already was.
     meta = pd.read_sql_query(
-        "SELECT c.miu_id, c.meter_number, c.account_number, b.customer_name "
+        "SELECT c.miu_id, c.meter_number, c.account_number, b.customer_name, "
+        "       b.location AS address, b.primary_phone, b.secondary_phone, b.email_address "
         "FROM customers c LEFT JOIN customer_billing b ON b.meter_id = c.miu_id",
         _conn,
     )
@@ -580,9 +606,19 @@ with tab_continuous:
                 display["customer"] = display["customer_name"].where(
                     display["customer_name"].notna(), "(no billing match)"
                 )
+                display["address"] = display["address"].fillna("")
+                # One "phone" column, preferring primary and falling back to
+                # secondary rather than showing two mostly-empty columns.
+                display["phone"] = display["primary_phone"].where(
+                    display["primary_phone"].notna(), display["secondary_phone"]
+                ).fillna("")
+                display["email"] = display["email_address"].fillna("")
                 display = display[
                     [
                         "customer",
+                        "address",
+                        "phone",
+                        "email",
                         "account_number",
                         "meter_number",
                         "continuous_since",
