@@ -202,16 +202,24 @@ CREATE TABLE IF NOT EXISTS building_size_zones (
 -- not -- that's how the existing "continuous" definition already worked,
 -- kept as-is here rather than silently changed.
 CREATE TABLE IF NOT EXISTS meter_leak_status (
-    miu_id             TEXT PRIMARY KEY,
-    window_start       TEXT NOT NULL,
-    window_end         TEXT NOT NULL,
-    reading_count      INTEGER NOT NULL,
-    zero_count         INTEGER NOT NULL,
-    min_consumption    REAL,
-    total_consumption  REAL,
-    streak_start       TEXT,
-    since_data_began   INTEGER NOT NULL DEFAULT 0,
-    computed_at        TEXT NOT NULL
+    miu_id                 TEXT PRIMARY KEY,
+    window_start           TEXT NOT NULL,
+    window_end             TEXT NOT NULL,
+    reading_count          INTEGER NOT NULL,
+    zero_count             INTEGER NOT NULL,
+    min_consumption        REAL,
+    -- Lowest 3-hour rolling average in the window, instead of the lowest
+    -- single reading. A single hourly reading can under-report and get
+    -- made up for in the next hour's reading (seen directly in real meter
+    -- data -- see the backlog doc), which drags min_consumption down below
+    -- the meter's real sustained rate. Smoothing over 3 hours absorbs that
+    -- without losing real, multi-hour dips. NULL for a meter with fewer
+    -- than 3 readings in the window.
+    roll3_min_consumption  REAL,
+    total_consumption      REAL,
+    streak_start           TEXT,
+    since_data_began       INTEGER NOT NULL DEFAULT 0,
+    computed_at            TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_water_usage_miu ON water_usage(miu_id);
@@ -245,6 +253,9 @@ VALID_ROLES = ("viewer", "admin", "global")
 # each value is (column_name, column_type_and_default) as it'd appear in
 # ADD COLUMN.
 _COLUMN_MIGRATIONS = {
+    "meter_leak_status": [
+        ("roll3_min_consumption", "REAL"),
+    ],
     "parcels": [
         ("area_sqft", "REAL"),
         ("area_acres", "REAL"),
@@ -451,15 +462,26 @@ def recompute_leak_status(conn):
         r["miu_id"]: r
         for r in conn.execute(
             """
+            WITH windowed AS (
+                SELECT miu_id, consumption_with_multiplier AS gal,
+                       AVG(consumption_with_multiplier) OVER (
+                           PARTITION BY miu_id ORDER BY reading_date
+                           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                       ) AS roll3_avg,
+                       COUNT(*) OVER (
+                           PARTITION BY miu_id ORDER BY reading_date
+                           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                       ) AS roll3_count
+                FROM water_usage
+                WHERE reading_date > ? AND reading_date <= ?
+            )
             SELECT miu_id,
-                   COUNT(consumption_with_multiplier) AS reading_count,
-                   SUM(CASE WHEN consumption_with_multiplier IS NULL
-                             OR consumption_with_multiplier <= 0
-                        THEN 1 ELSE 0 END) AS zero_count,
-                   MIN(consumption_with_multiplier) AS min_consumption,
-                   SUM(consumption_with_multiplier) AS total_consumption
-            FROM water_usage
-            WHERE reading_date > ? AND reading_date <= ?
+                   COUNT(gal) AS reading_count,
+                   SUM(CASE WHEN gal IS NULL OR gal <= 0 THEN 1 ELSE 0 END) AS zero_count,
+                   MIN(gal) AS min_consumption,
+                   MIN(CASE WHEN roll3_count = 3 THEN roll3_avg END) AS roll3_min_consumption,
+                   SUM(gal) AS total_consumption
+            FROM windowed
             GROUP BY miu_id
             """,
             (window_start, max_date),
@@ -497,6 +519,7 @@ def recompute_leak_status(conn):
             "reading_count": w["reading_count"],
             "zero_count": w["zero_count"],
             "min_consumption": w["min_consumption"],
+            "roll3_min_consumption": w["roll3_min_consumption"],
             "total_consumption": w["total_consumption"],
             "streak_start": s["streak_start"] if s else None,
             "since_data_began": s["since_data_began"] if s else 0,
@@ -508,10 +531,11 @@ def recompute_leak_status(conn):
         """
         INSERT INTO meter_leak_status
             (miu_id, window_start, window_end, reading_count, zero_count,
-             min_consumption, total_consumption, streak_start, since_data_began, computed_at)
+             min_consumption, roll3_min_consumption, total_consumption,
+             streak_start, since_data_began, computed_at)
         VALUES (:miu_id, :window_start, :window_end, :reading_count, :zero_count,
-                :min_consumption, :total_consumption, :streak_start, :since_data_began,
-                :computed_at)
+                :min_consumption, :roll3_min_consumption, :total_consumption,
+                :streak_start, :since_data_began, :computed_at)
         """,
         leak_rows,
     )

@@ -149,7 +149,7 @@ def _cached_leak_status(_conn):
     cols = [
         "miu_id", "window_start", "window_end", "meter_number", "account_number",
         "customer_name", "address", "primary_phone", "secondary_phone", "email_address",
-        "reading_count", "zero_count", "min_consumption",
+        "reading_count", "zero_count", "min_consumption", "roll3_min_consumption",
         "total_consumption", "streak_start", "since_data_began",
     ]
     status = pd.read_sql_query("SELECT * FROM meter_leak_status", _conn)
@@ -548,9 +548,10 @@ with tab_continuous:
         "are fine, they're just not counted either way; the >7 threshold filters "
         "out meters with only a stray reading or two, which would otherwise look "
         "trivially \"continuous\"). This usually means water is running nonstop — "
-        "a running toilet, a stuck irrigation valve, or a leak. Sorted by the "
-        "lowest hourly reading in that window — every hour this meter ran was "
-        "at least this much, so it's a guaranteed floor on how bad the leak is."
+        "a running toilet, a stuck irrigation valve, or a leak. Choose below whether "
+        "to sort by the raw lowest hourly reading, or by the 3-hour rolling-average "
+        "floor, which smooths out single-hour meter-reporting glitches (a low read "
+        "that gets made up for in the next hour) to show the real sustained rate."
     )
 
     has_usage = conn.execute("SELECT 1 FROM water_usage LIMIT 1").fetchone() is not None
@@ -586,15 +587,35 @@ with tab_continuous:
                 "usage data has synced."
             )
         else:
+            sort_choice = st.radio(
+                "Sort by",
+                ["Lowest hourly reading (raw)", "3-hour rolling floor (smoothed)"],
+                horizontal=True,
+                key="continuous_sort_by",
+                help=(
+                    "Raw is the single lowest hourly reading in the week — a guaranteed "
+                    "floor, but a one-hour meter-reporting glitch can make it look lower "
+                    "than the leak really is. The 3-hour rolling floor averages each "
+                    "reading with its two neighbors first, which smooths that out and is "
+                    "usually the more accurate 'real' leak size."
+                ),
+            )
+            sort_col = "roll3_min_consumption" if sort_choice.startswith("3-hour") else "min_consumption"
+
             show_smaller = st.toggle(
                 "Also show smaller leaks (5+ gal/hr, instead of just 10+ gal/hr)",
                 value=False,
                 key="continuous_show_smaller",
             )
             threshold = 5 if show_smaller else 10
-            filtered = continuous[continuous["min_consumption"] >= threshold]
+            filtered = (
+                continuous[continuous[sort_col] >= threshold]
+                .sort_values(sort_col, ascending=False)
+                .reset_index(drop=True)
+            )
             st.caption(
-                f"Showing meters with a continuous flow of at least **{threshold} gal/hr** — "
+                f"Showing meters with a continuous flow of at least **{threshold} gal/hr** by the "
+                f"{'raw' if sort_col == 'min_consumption' else '3-hour rolling'} measure — "
                 "below that, a nonstop trickle is more likely a slow drip than a leak worth "
                 "a call. Toggle above to lower the bar to 5 gal/hr."
             )
@@ -613,6 +634,7 @@ with tab_continuous:
                     display["primary_phone"].notna(), display["secondary_phone"]
                 ).fillna("")
                 display["email"] = display["email_address"].fillna("")
+                display["roll3_min_consumption"] = display["roll3_min_consumption"].round(1)
                 display = display[
                     [
                         "customer",
@@ -623,6 +645,7 @@ with tab_continuous:
                         "meter_number",
                         "continuous_since",
                         "min_consumption",
+                        "roll3_min_consumption",
                         "total_consumption",
                         "reading_count",
                     ]
@@ -632,6 +655,7 @@ with tab_continuous:
                         "meter_number": "meter",
                         "continuous_since": "continuous since",
                         "min_consumption": "lowest hourly reading",
+                        "roll3_min_consumption": "3-hr rolling floor",
                         "total_consumption": "total gallons this week",
                         "reading_count": "hourly readings",
                     }
@@ -641,8 +665,11 @@ with tab_continuous:
                     "reading — everything after that has been nonstop. A **≥** date means "
                     "it's never once read zero in all our recorded history, so the real "
                     "start may be earlier than we can see. \"Lowest hourly reading\" is the "
-                    "single smallest raw reading in the window — what this list is sorted "
-                    "and filtered by, since every hour was at least that much."
+                    "single smallest raw reading in the window. \"3-hr rolling floor\" "
+                    "averages each reading with its two neighbors first, smoothing out "
+                    "single-hour reporting glitches (a low read that gets made up for in "
+                    "the next hour) — usually the more accurate real leak size. This list "
+                    "is sorted and filtered by whichever one is selected above."
                 )
                 st.caption("Click a row to see that meter's usage below.")
                 event = st.dataframe(
