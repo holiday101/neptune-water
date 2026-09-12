@@ -527,6 +527,126 @@ with tab_usage:
     if meters.empty:
         st.info("No water usage data yet. Go to **Sync & Backfill** to pull some.")
     else:
+        st.markdown("#### Leaderboard — last 7 days")
+        leak_window = pd.read_sql_query(
+            "SELECT window_start, window_end FROM meter_leak_status LIMIT 1", conn
+        )
+        if leak_window.empty:
+            st.info(
+                "Usage totals haven't been computed for this data yet — they're "
+                "refreshed automatically after each sync. Check **Sync & Backfill**, "
+                "or run one now."
+            )
+        else:
+            window_start_str = leak_window["window_start"].iloc[0]
+            window_end_str = leak_window["window_end"].iloc[0]
+            st.caption(
+                f"Window: {_fmt_dt(window_start_str)} → {_fmt_dt(window_end_str)}. "
+                "The 7-day avg column is each meter's total gallons in that window "
+                "divided by 7 days — an average daily rate, not just the raw total. "
+                "Ranked by highest usage first; click any column header to re-sort."
+            )
+            weekly = pd.read_sql_query(
+                "SELECT miu_id, reading_count, total_consumption FROM meter_leak_status "
+                "WHERE total_consumption IS NOT NULL",
+                conn,
+            )
+            customers_df = _cached_customers_df(conn)
+            board = weekly.merge(customers_df, on="miu_id", how="left")
+
+            if board.empty:
+                st.info("No meters had any usage in the last 7 days.")
+            else:
+                board["7_day_avg"] = board["total_consumption"] / 7.0
+                board["lot_zone_label"] = board["lot_zone_label"].fillna("No parcel match")
+
+                zone_options = (
+                    board[["lot_zone", "lot_zone_label"]]
+                    .dropna(subset=["lot_zone"])
+                    .drop_duplicates()
+                    .sort_values("lot_zone")["lot_zone_label"]
+                    .tolist()
+                )
+                if "No parcel match" not in zone_options and (board["lot_zone_label"] == "No parcel match").any():
+                    zone_options.append("No parcel match")
+                zone_choices = st.multiselect(
+                    "Filter by lot-size zone",
+                    zone_options,
+                    default=[],
+                    key="usage_leaderboard_zone_filter",
+                    help="Leave empty to show every zone.",
+                )
+                filtered_board = (
+                    board[board["lot_zone_label"].isin(zone_choices)] if zone_choices else board
+                )
+
+                if filtered_board.empty:
+                    st.info("No meters match that zone filter.")
+                else:
+                    filtered_board = filtered_board.sort_values(
+                        "total_consumption", ascending=False
+                    ).reset_index(drop=True)
+
+                    display_board = filtered_board.copy()
+                    display_board["customer"] = display_board["customer_name"].where(
+                        display_board["customer_name"].notna(), "(no billing match)"
+                    )
+                    display_board["address"] = display_board["location"].fillna("")
+                    display_board["total_consumption"] = display_board["total_consumption"].round().astype("Int64")
+                    display_board["7_day_avg"] = display_board["7_day_avg"].round(1)
+                    display_board.insert(0, "rank", display_board.index + 1)
+                    display_board = display_board[
+                        [
+                            "rank",
+                            "customer",
+                            "address",
+                            "account_number",
+                            "meter_number",
+                            "lot_zone_label",
+                            "total_consumption",
+                            "7_day_avg",
+                            "reading_count",
+                        ]
+                    ].rename(
+                        columns={
+                            "account_number": "account",
+                            "meter_number": "meter",
+                            "lot_zone_label": "lot zone",
+                            "total_consumption": "7-day total (gal)",
+                            "7_day_avg": "7-day avg (gal/day)",
+                            "reading_count": "readings this week",
+                        }
+                    )
+                    board_event = st.dataframe(
+                        display_board,
+                        use_container_width=True,
+                        hide_index=True,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        key="usage_leaderboard_table",
+                    )
+                    st.caption(f"{len(display_board)} meters with usage this week")
+                    st.download_button(
+                        "Download CSV",
+                        display_board.to_csv(index=False),
+                        file_name="water_usage_leaderboard.csv",
+                        key="usage_leaderboard_download",
+                    )
+
+                    selected_rows = board_event["selection"]["rows"] if board_event else []
+                    if selected_rows:
+                        sel = filtered_board.iloc[selected_rows[0]]
+                        label = (
+                            sel["customer_name"] if pd.notna(sel["customer_name"])
+                            else f"acct {sel['account_number'] or '(no account)'}"
+                        )
+                        st.markdown(f"##### Usage for {label} — meter {sel['meter_number']}")
+                        _render_usage_chart(
+                            conn, sel["miu_id"], key_prefix="usage_leaderboard_selected", default_view="Last 7"
+                        )
+
+        st.markdown("---")
+        st.markdown("#### Or look up a specific meter")
         options = {
             (
                 f"{r.customer_name} — meter {r.meter_number} — acct {r.account_number or '(no account)'}"
