@@ -10,6 +10,7 @@ import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
@@ -46,6 +47,19 @@ def _leak_color(min_consumption, threshold):
         return [70, 130, 220, 60]
     t = min(math.log(max(min_consumption, threshold) / threshold + 1) / math.log(50), 1.0)
     return [255, int(215 * (1 - t)), 0, 200]
+
+
+def _haversine_ft(lat1, lon1, lat2, lon2):
+    """Great-circle distance in feet between one (lat1, lon1) point and one or
+    more (lat2, lon2) points (numpy arrays or scalars) -- used to rank a
+    meter's nearest neighbors by surveyed GPS location."""
+    r_m = 6371000.0
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(np.asarray(lat2, dtype=float) - lat1)
+    dlambda = np.radians(np.asarray(lon2, dtype=float) - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
+    dist_m = 2 * r_m * np.arcsin(np.sqrt(a))
+    return dist_m * 3.28084
 
 
 # ---- cached queries -------------------------------------------------------
@@ -173,6 +187,30 @@ def _cached_leak_status(_conn):
         qualifying.merge(meta, on="miu_id", how="left")
         .sort_values("min_consumption", ascending=False)
         .reset_index(drop=True)
+    )
+
+
+@st.cache_data
+def _cached_meter_coords(_conn):
+    """One row per meter with usage data AND a known lat/lon, for the
+    nearest-neighbor usage comparison in _render_usage_chart. lat/lon comes
+    from meter_parcels (populated for 'geocoded' and 'gis_survey' matches;
+    'address_exact'/'address_prefix' matches have no coordinate and are
+    excluded here -- string-matched only, nothing to measure distance from)."""
+    return pd.read_sql_query(
+        """
+        SELECT c.miu_id, mp.lat, mp.lon, b.customer_name, b.location AS address,
+               lz.zone AS lot_zone, lz.label AS lot_zone_label
+        FROM customers c
+        JOIN meter_parcels mp ON mp.meter_id = c.miu_id AND mp.lat IS NOT NULL
+        LEFT JOIN customer_billing b ON b.meter_id = c.miu_id
+        LEFT JOIN parcels p ON p.parcel_id = mp.parcel_id
+        LEFT JOIN lot_size_zones lz
+            ON p.area_sqft >= lz.min_sqft
+           AND (lz.max_sqft IS NULL OR p.area_sqft < lz.max_sqft)
+        WHERE EXISTS (SELECT 1 FROM water_usage w WHERE w.miu_id = c.miu_id)
+        """,
+        _conn,
     )
 
 
@@ -518,6 +556,82 @@ def _render_usage_chart(conn, miu_id, key_prefix, default_view="Last 7"):
         "Download CSV", csv_df.to_csv(index=False),
         file_name=f"{miu_id}_usage.csv", key=f"{key_prefix}_download",
     )
+
+    with st.expander("Compare to nearby meters"):
+        coords = _cached_meter_coords(conn)
+        me = coords[coords["miu_id"] == miu_id]
+        if me.empty:
+            st.caption(
+                "No surveyed GPS location for this meter, so a nearby-meter "
+                "comparison isn't available."
+            )
+        else:
+            me = me.iloc[0]
+            n_choice = st.selectbox(
+                "Compare to nearest", [5, 10, 20, 50], index=1,
+                key=f"{key_prefix}_neighbor_n",
+            )
+            others = coords[coords["miu_id"] != miu_id].copy()
+            others["distance_ft"] = _haversine_ft(
+                me["lat"], me["lon"], others["lat"].to_numpy(), others["lon"].to_numpy()
+            )
+            nearest = others.nsmallest(n_choice, "distance_ft").copy()
+
+            weekly = pd.read_sql_query(
+                "SELECT miu_id, total_consumption FROM meter_leak_status", conn
+            )
+            nearest = nearest.merge(weekly, on="miu_id", how="left")
+            nearest["7_day_avg"] = nearest["total_consumption"] / 7.0
+
+            my_weekly = weekly[weekly["miu_id"] == miu_id]["total_consumption"]
+            my_avg = my_weekly.iloc[0] / 7.0 if not my_weekly.empty and pd.notna(my_weekly.iloc[0]) else None
+            neighborhood_avg = nearest["7_day_avg"].mean()
+
+            if my_avg is not None and pd.notna(neighborhood_avg) and neighborhood_avg > 0:
+                pct = (my_avg - neighborhood_avg) / neighborhood_avg * 100
+                direction = "higher" if pct >= 0 else "lower"
+                st.caption(
+                    f"This meter averaged **{my_avg:,.0f} gal/day** this week vs "
+                    f"**{neighborhood_avg:,.0f} gal/day** average among the "
+                    f"{len(nearest)} nearest meters — **{abs(pct):.0f}% {direction}**."
+                )
+            elif pd.notna(neighborhood_avg):
+                st.caption(
+                    f"Average among the {len(nearest)} nearest meters: "
+                    f"{neighborhood_avg:,.0f} gal/day this week. This meter has no "
+                    "usage in the current 7-day window to compare."
+                )
+            else:
+                st.caption("No comparable usage data among nearby meters this week.")
+
+            display_neighbors = nearest.copy()
+            display_neighbors["customer"] = display_neighbors["customer_name"].where(
+                display_neighbors["customer_name"].notna(), "(no billing match)"
+            )
+            display_neighbors["address"] = display_neighbors["address"].fillna("")
+            display_neighbors["lot_zone_label"] = display_neighbors["lot_zone_label"].fillna("")
+            display_neighbors["distance_ft"] = display_neighbors["distance_ft"].round().astype("Int64")
+            display_neighbors["total_consumption"] = display_neighbors["total_consumption"].round().astype("Int64")
+            display_neighbors["7_day_avg"] = display_neighbors["7_day_avg"].round(1)
+            display_neighbors = display_neighbors[
+                [
+                    "distance_ft", "customer", "address", "lot_zone_label",
+                    "total_consumption", "7_day_avg",
+                ]
+            ].rename(
+                columns={
+                    "distance_ft": "distance (ft)",
+                    "lot_zone_label": "lot zone",
+                    "total_consumption": "7-day total (gal)",
+                    "7_day_avg": "7-day avg (gal/day)",
+                }
+            ).sort_values("distance (ft)").reset_index(drop=True)
+            st.dataframe(display_neighbors, use_container_width=True, hide_index=True)
+            st.caption(
+                "Distance is straight-line, from the utility's surveyed GPS meter "
+                "locations where available. Usage columns are blank for a neighbor "
+                "with no reading in the current trailing-7-day window."
+            )
 
 
 # ----------------------------------------------------------- Water Usage --
