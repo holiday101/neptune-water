@@ -535,6 +535,74 @@ def _load_meter_usage(conn, miu_id, view):
     return df
 
 
+# Trailing-`days`-day reading_count/total_consumption for every meter,
+# computed live -- used only for the leaderboard's "Last 30 days" view;
+# meter_leak_status only ever holds the fixed 7-day window computed at sync
+# time (see LEAK_STATUS_WINDOW_DAYS in neptune_db.py). Bounded by
+# idx_water_usage_date regardless of how large water_usage's full history
+# grows (measured ~1s city-wide against 2,600 meters / 11M+ rows), and
+# cached via st.cache_data same as everything else here -- cleared on every
+# sync, same lifetime as the 7-day figures.
+@st.cache_data
+def _cached_window_totals(_conn, days):
+    row = _conn.execute("SELECT MAX(reading_date) AS m FROM water_usage").fetchone()
+    max_date = row["m"] if row else None
+    if not max_date:
+        return pd.DataFrame(columns=["miu_id", "reading_count", "total_consumption"])
+    window_start = (pd.Timestamp(max_date) - timedelta(days=days)).isoformat()
+    return pd.read_sql_query(
+        "SELECT miu_id, COUNT(*) AS reading_count, "
+        "SUM(consumption_with_multiplier) AS total_consumption "
+        "FROM water_usage WHERE reading_date > ? AND reading_date <= ? GROUP BY miu_id",
+        _conn, params=(window_start, max_date),
+    )
+
+
+# Same as _cached_window_totals above, but scoped to a specific set of
+# meters (e.g. one meter's nearby neighbors) via an IN-list instead of every
+# meter city-wide. Used by the nearby-meter comparison's week/month toggle.
+@st.cache_data
+def _cached_window_totals_for_meters(_conn, miu_ids, days):
+    if not miu_ids:
+        return pd.DataFrame(columns=["miu_id", "reading_count", "total_consumption"])
+    row = _conn.execute("SELECT MAX(reading_date) AS m FROM water_usage").fetchone()
+    max_date = row["m"] if row else None
+    if not max_date:
+        return pd.DataFrame(columns=["miu_id", "reading_count", "total_consumption"])
+    window_start = (pd.Timestamp(max_date) - timedelta(days=days)).isoformat()
+    placeholders = ",".join("?" for _ in miu_ids)
+    return pd.read_sql_query(
+        f"SELECT miu_id, COUNT(*) AS reading_count, "
+        f"SUM(consumption_with_multiplier) AS total_consumption "
+        f"FROM water_usage WHERE miu_id IN ({placeholders}) "
+        f"AND reading_date > ? AND reading_date <= ? GROUP BY miu_id",
+        _conn, params=(*miu_ids, window_start, max_date),
+    )
+
+
+# Per-day totals for one meter, trailing `days` days ending at that meter's
+# own most recent reading (same relative-window convention as
+# _load_meter_usage above) -- lets the daily breakdown under the
+# nearby-meter comparison show which specific days drove the total, rather
+# than just the window's aggregate total/average.
+@st.cache_data
+def _cached_daily_usage(_conn, miu_id, days):
+    row = _conn.execute(
+        "SELECT MAX(reading_date) AS m FROM water_usage WHERE miu_id = ?", (miu_id,)
+    ).fetchone()
+    if not row or not row["m"]:
+        return pd.DataFrame(columns=["day", "gallons"])
+    window_end = pd.Timestamp(row["m"])
+    window_start = window_end - timedelta(days=days)
+    return pd.read_sql_query(
+        "SELECT date(reading_date) AS day, "
+        "SUM(consumption_with_multiplier) AS gallons "
+        "FROM water_usage WHERE miu_id = ? AND reading_date > ? AND reading_date <= ? "
+        "GROUP BY date(reading_date) ORDER BY day",
+        _conn, params=(miu_id, window_start.isoformat(), row["m"]),
+    )
+
+
 def _render_usage_chart(conn, miu_id, key_prefix, default_view="Last 7"):
     """View-range selector + chart + table + CSV download for one meter."""
     views = list(USAGE_VIEWS.keys())
@@ -558,6 +626,13 @@ def _render_usage_chart(conn, miu_id, key_prefix, default_view="Last 7"):
     )
 
     with st.expander("Compare to nearby meters"):
+        window_choice = st.radio(
+            "Compare over", ["Last week", "Last month"],
+            horizontal=True, key=f"{key_prefix}_compare_window",
+        )
+        cmp_days = 7 if window_choice == "Last week" else 30
+        window_label = window_choice.lower()
+
         coords = _cached_meter_coords(conn)
         me = coords[coords["miu_id"] == miu_id]
         if me.empty:
@@ -577,32 +652,34 @@ def _render_usage_chart(conn, miu_id, key_prefix, default_view="Last 7"):
             )
             nearest = others.nsmallest(n_choice, "distance_ft").copy()
 
-            weekly = pd.read_sql_query(
-                "SELECT miu_id, total_consumption FROM meter_leak_status", conn
+            window_totals = _cached_window_totals_for_meters(
+                conn, tuple(nearest["miu_id"]) + (miu_id,), cmp_days
             )
-            nearest = nearest.merge(weekly, on="miu_id", how="left")
-            nearest["7_day_avg"] = nearest["total_consumption"] / 7.0
+            nearest = nearest.merge(
+                window_totals[["miu_id", "total_consumption"]], on="miu_id", how="left"
+            )
+            nearest["window_avg"] = nearest["total_consumption"] / cmp_days
 
-            my_weekly = weekly[weekly["miu_id"] == miu_id]["total_consumption"]
-            my_avg = my_weekly.iloc[0] / 7.0 if not my_weekly.empty and pd.notna(my_weekly.iloc[0]) else None
-            neighborhood_avg = nearest["7_day_avg"].mean()
+            my_total = window_totals.loc[window_totals["miu_id"] == miu_id, "total_consumption"]
+            my_avg = my_total.iloc[0] / cmp_days if not my_total.empty and pd.notna(my_total.iloc[0]) else None
+            neighborhood_avg = nearest["window_avg"].mean()
 
             if my_avg is not None and pd.notna(neighborhood_avg) and neighborhood_avg > 0:
                 pct = (my_avg - neighborhood_avg) / neighborhood_avg * 100
                 direction = "higher" if pct >= 0 else "lower"
                 st.caption(
-                    f"This meter averaged **{my_avg:,.0f} gal/day** this week vs "
+                    f"This meter averaged **{my_avg:,.0f} gal/day** over the {window_label} vs "
                     f"**{neighborhood_avg:,.0f} gal/day** average among the "
                     f"{len(nearest)} nearest meters — **{abs(pct):.0f}% {direction}**."
                 )
             elif pd.notna(neighborhood_avg):
                 st.caption(
                     f"Average among the {len(nearest)} nearest meters: "
-                    f"{neighborhood_avg:,.0f} gal/day this week. This meter has no "
-                    "usage in the current 7-day window to compare."
+                    f"{neighborhood_avg:,.0f} gal/day over the {window_label}. This meter has no "
+                    f"usage in the current {window_label} window to compare."
                 )
             else:
-                st.caption("No comparable usage data among nearby meters this week.")
+                st.caption(f"No comparable usage data among nearby meters over the {window_label}.")
 
             display_neighbors = nearest.copy()
             display_neighbors["customer"] = display_neighbors["customer_name"].where(
@@ -612,25 +689,43 @@ def _render_usage_chart(conn, miu_id, key_prefix, default_view="Last 7"):
             display_neighbors["lot_zone_label"] = display_neighbors["lot_zone_label"].fillna("")
             display_neighbors["distance_ft"] = display_neighbors["distance_ft"].round().astype("Int64")
             display_neighbors["total_consumption"] = display_neighbors["total_consumption"].round().astype("Int64")
-            display_neighbors["7_day_avg"] = display_neighbors["7_day_avg"].round(1)
+            display_neighbors["window_avg"] = display_neighbors["window_avg"].round(1)
             display_neighbors = display_neighbors[
                 [
                     "distance_ft", "customer", "address", "lot_zone_label",
-                    "total_consumption", "7_day_avg",
+                    "total_consumption", "window_avg",
                 ]
             ].rename(
                 columns={
                     "distance_ft": "distance (ft)",
                     "lot_zone_label": "lot zone",
-                    "total_consumption": "7-day total (gal)",
-                    "7_day_avg": "7-day avg (gal/day)",
+                    "total_consumption": f"{window_label} total (gal)",
+                    "window_avg": f"{window_label} avg (gal/day)",
                 }
             ).sort_values("distance (ft)").reset_index(drop=True)
             st.dataframe(display_neighbors, use_container_width=True, hide_index=True)
             st.caption(
                 "Distance is straight-line, from the utility's surveyed GPS meter "
                 "locations where available. Usage columns are blank for a neighbor "
-                "with no reading in the current trailing-7-day window."
+                f"with no reading in the current {window_label} window."
+            )
+
+        st.markdown("###### Daily usage — this meter")
+        daily = _cached_daily_usage(conn, miu_id, cmp_days)
+        if daily.empty:
+            st.caption("No usage data in this window.")
+        else:
+            daily_display = daily.copy()
+            daily_display["gallons"] = daily_display["gallons"].round().astype("Int64")
+            st.bar_chart(daily_display.set_index("day")["gallons"])
+            st.dataframe(
+                daily_display.rename(columns={"day": "Day", "gallons": "Gallons"}),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                f"Each bar is that day's total gallons, over the {window_label} "
+                "shown above -- use it to see which specific days drove the total, "
+                "rather than just the average."
             )
 
 
@@ -641,7 +736,12 @@ with tab_usage:
     if meters.empty:
         st.info("No water usage data yet. Go to **Sync & Backfill** to pull some.")
     else:
-        st.markdown("#### Leaderboard — last 7 days")
+        board_window_choice = st.radio(
+            "Leaderboard window", ["Last 7 days", "Last 30 days"],
+            horizontal=True, key="usage_leaderboard_window",
+        )
+        board_days = 7 if board_window_choice == "Last 7 days" else 30
+        st.markdown(f"#### Leaderboard — {board_window_choice.lower()}")
         leak_window = pd.read_sql_query(
             "SELECT window_start, window_end FROM meter_leak_status LIMIT 1", conn
         )
@@ -652,26 +752,42 @@ with tab_usage:
                 "or run one now."
             )
         else:
-            window_start_str = leak_window["window_start"].iloc[0]
-            window_end_str = leak_window["window_end"].iloc[0]
+            if board_days == 7:
+                # Already precomputed by the sync job -- see meter_leak_status /
+                # LEAK_STATUS_WINDOW_DAYS in neptune_db.py -- so the default
+                # 7-day view stays a cheap read with no live aggregation.
+                window_start_str = leak_window["window_start"].iloc[0]
+                window_end_str = leak_window["window_end"].iloc[0]
+                weekly = pd.read_sql_query(
+                    "SELECT miu_id, reading_count, total_consumption FROM meter_leak_status "
+                    "WHERE total_consumption IS NOT NULL",
+                    conn,
+                )
+            else:
+                # meter_leak_status only ever holds the fixed 7-day window, so
+                # "Last 30 days" is computed live instead -- see
+                # _cached_window_totals for why that stays cheap even as
+                # water_usage's full history keeps growing.
+                window_end_str = leak_window["window_end"].iloc[0]
+                window_start_str = (
+                    pd.Timestamp(window_end_str) - timedelta(days=board_days)
+                ).isoformat()
+                weekly = _cached_window_totals(conn, board_days)
+                weekly = weekly[weekly["total_consumption"].notna()]
             st.caption(
                 f"Window: {_fmt_dt(window_start_str)} → {_fmt_dt(window_end_str)}. "
-                "The 7-day avg column is each meter's total gallons in that window "
-                "divided by 7 days — an average daily rate, not just the raw total. "
-                "Ranked by highest usage first; click any column header to re-sort."
-            )
-            weekly = pd.read_sql_query(
-                "SELECT miu_id, reading_count, total_consumption FROM meter_leak_status "
-                "WHERE total_consumption IS NOT NULL",
-                conn,
+                f"The {board_days}-day avg column is each meter's total gallons in "
+                f"that window divided by {board_days} days — an average daily rate, "
+                "not just the raw total. Ranked by highest usage first; click any "
+                "column header to re-sort."
             )
             customers_df = _cached_customers_df(conn)
             board = weekly.merge(customers_df, on="miu_id", how="left")
 
             if board.empty:
-                st.info("No meters had any usage in the last 7 days.")
+                st.info(f"No meters had any usage in the {board_window_choice.lower()}.")
             else:
-                board["7_day_avg"] = board["total_consumption"] / 7.0
+                board["7_day_avg"] = board["total_consumption"] / board_days
                 board["lot_zone_label"] = board["lot_zone_label"].fillna("No parcel match")
 
                 zone_options = (
@@ -726,9 +842,9 @@ with tab_usage:
                             "account_number": "account",
                             "meter_number": "meter",
                             "lot_zone_label": "lot zone",
-                            "total_consumption": "7-day total (gal)",
-                            "7_day_avg": "7-day avg (gal/day)",
-                            "reading_count": "readings this week",
+                            "total_consumption": f"{board_days}-day total (gal)",
+                            "7_day_avg": f"{board_days}-day avg (gal/day)",
+                            "reading_count": f"readings in {board_window_choice.lower()}",
                         }
                     )
                     board_event = st.dataframe(
@@ -739,7 +855,7 @@ with tab_usage:
                         selection_mode="single-row",
                         key="usage_leaderboard_table",
                     )
-                    st.caption(f"{len(display_board)} meters with usage this week")
+                    st.caption(f"{len(display_board)} meters with usage in the {board_window_choice.lower()}")
                     st.download_button(
                         "Download CSV",
                         display_board.to_csv(index=False),
